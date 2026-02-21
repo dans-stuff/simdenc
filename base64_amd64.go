@@ -39,6 +39,14 @@ var (
 
 	// Tier 2 decode: single VPERMB replaces VPSHUFB+VPERMD.
 	decVBMICompact archsimd.Uint8x32
+
+	// Tier 2 encode 512-bit vectors.
+	enc512Reshuf archsimd.Uint8x64
+	enc512MulhiM archsimd.Uint16x32
+	enc512MulhiC archsimd.Uint16x32
+	enc512MulloM archsimd.Uint16x32
+	enc512MulloC archsimd.Uint16x32
+	enc512Lut    archsimd.Uint8x64
 )
 
 // Tier 1: AVX2 (works under Rosetta emulation).
@@ -57,7 +65,12 @@ func init() {
 		return
 	}
 	initVBMI()
-	bulkEncode = encodeVBMI
+	init512()
+	bulkEncode = func(dst, src []byte) (di, si int) {
+		di, si = encode512(dst, src)
+		di2, si2 := encodeVBMI(dst[di:], src[si:])
+		return di + di2, si + si2
+	}
 	bulkDecode = decodeVBMI
 }
 
@@ -79,6 +92,16 @@ func u16pair(even, odd uint16) archsimd.Uint16x16 {
 		a[i+1] = odd
 	}
 	return archsimd.LoadUint16x16(&a)
+}
+
+// u16pair32 fills a 512-bit vector with alternating uint16 values.
+func u16pair32(even, odd uint16) archsimd.Uint16x32 {
+	var a [32]uint16
+	for i := 0; i < 32; i += 2 {
+		a[i] = even
+		a[i+1] = odd
+	}
+	return archsimd.LoadUint16x32(&a)
 }
 
 // --- Init ---
@@ -172,6 +195,36 @@ func initVBMI() {
 	})
 }
 
+func init512() {
+	var er [64]byte
+	pat := [16]byte{1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10}
+	for lane := range 4 {
+		for i := range 16 {
+			er[lane*16+i] = pat[i] + byte(lane*12)
+		}
+	}
+	enc512Reshuf = archsimd.LoadUint8x64(&er)
+
+	enc512MulhiM = u16pair32(0xFC00, 0x0FC0)
+	enc512MulhiC = u16pair32(0x0040, 0x0400)
+	enc512MulloM = u16pair32(0x03F0, 0x003F)
+	enc512MulloC = u16pair32(0x0010, 0x0100)
+
+	var lut [64]byte
+	for i := range 26 {
+		lut[i] = 65 // A-Z
+	}
+	for i := 26; i < 52; i++ {
+		lut[i] = 71 // a-z
+	}
+	for i := 52; i < 62; i++ {
+		lut[i] = 252 // 0-9
+	}
+	lut[62] = 237 // +
+	lut[63] = 240 // /
+	enc512Lut = archsimd.LoadUint8x64(&lut)
+}
+
 // --- Tier 1: AVX2 ---
 
 // encodeAVX2 encodes 24-byte blocks using the -4 offset load trick.
@@ -193,7 +246,7 @@ func encodeAVX2(dst, src []byte) (di, si int) {
 	si = 6
 	di = 8
 
-	// Local copies keep constants in registers (measured +37% without).
+	// Local copies keep constants in registers (+37% without — see RESEARCH.md).
 	reshuf := encAVX2Reshuf
 	mulhiM := encMulhiM
 	mulhiC := encMulhiC
@@ -225,7 +278,7 @@ func encodeAVX2(dst, src []byte) (di, si int) {
 
 // decodeAVX2 decodes 32-byte blocks. Stops on invalid input.
 func decodeAVX2(dst, src []byte) (di, si int) {
-	// Local copies keep constants in registers (measured +32% without).
+	// Local copies keep constants in registers (+32% without — see RESEARCH.md).
 	nmask := nibbleMask
 	lutHi := decLutHi
 	lutLo := decLutLo
@@ -337,6 +390,40 @@ func decodeVBMI(dst, src []byte) (di, si int) {
 		result.StoreSlice(d[:32])
 		si += 32
 		di += 24
+	}
+	return di, si
+}
+
+// --- Tier 2: AVX-512 encode ---
+
+// encode512 encodes 48-byte blocks using 512-bit vectors with VPERMB LUT.
+func encode512(dst, src []byte) (di, si int) {
+	srcEnd := len(src) - 64
+	dstEnd := len(dst) - 64
+	if srcEnd < 0 || dstEnd < 0 {
+		return 0, 0
+	}
+
+	reshuf := enc512Reshuf
+	mulhiM := enc512MulhiM
+	mulhiC := enc512MulhiC
+	mulloM := enc512MulloM
+	mulloC := enc512MulloC
+	lut := enc512Lut
+
+	for si <= srcEnd && di <= dstEnd {
+		raw := archsimd.LoadUint8x64Slice(src[si : si+64])
+		reshuffled := raw.Permute(reshuf)
+		asU16 := reshuffled.AsUint16x32()
+		hi := asU16.And(mulhiM).MulHigh(mulhiC)
+		lo := asU16.And(mulloM).Mul(mulloC)
+		sextets := hi.Or(lo).AsUint8x64()
+		delta := lut.Permute(sextets)
+		result := sextets.Add(delta)
+		d := dst[di:]
+		result.StoreSlice(d[:64])
+		si += 48
+		di += 64
 	}
 	return di, si
 }
