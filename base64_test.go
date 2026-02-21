@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"testing"
+
+	emmansun "github.com/emmansun/base64"
 )
 
 // --- Correctness ---
@@ -153,12 +155,14 @@ func FuzzEncode(f *testing.F) {
 	f.Add(randfuzz(1000))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
+		// Raw (no padding)
 		gotRaw := RawStdEncoding.EncodeToString(data)
 		wantRaw := base64.RawStdEncoding.EncodeToString(data)
 		if gotRaw != wantRaw {
 			t.Fatalf("RawStdEncoding mismatch for len %d:\n  got:  %q\n  want: %q", len(data), gotRaw, wantRaw)
 		}
 
+		// Padded
 		gotPad := StdEncoding.EncodeToString(data)
 		wantPad := base64.StdEncoding.EncodeToString(data)
 		if gotPad != wantPad {
@@ -175,6 +179,7 @@ func FuzzDecode(f *testing.F) {
 	f.Add(randfuzz(1000))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
+		// 1. Encode with stdlib, decode with both, compare.
 		encodedRaw := base64.RawStdEncoding.EncodeToString(data)
 		gotRaw, err := RawStdEncoding.DecodeString(encodedRaw)
 		if err != nil {
@@ -193,6 +198,8 @@ func FuzzDecode(f *testing.F) {
 			t.Fatalf("StdEncoding decode mismatch for len %d", len(data))
 		}
 
+		// 2. Feed raw random bytes as base64 input; b64simd must not panic.
+		//    If stdlib returns an error, b64simd should too.
 		_, stdErr := base64.RawStdEncoding.DecodeString(string(data))
 		_, simdErr := RawStdEncoding.DecodeString(string(data))
 		if stdErr != nil && simdErr == nil {
@@ -208,8 +215,14 @@ func randfuzz(n int) []byte {
 }
 
 // --- Benchmarks ---
+//
+// Three implementations compared at each size:
+//   simd     — production path (best available SIMD tier, or stdlib fallback)
+//   emmansun — github.com/emmansun/base64 (AVX2, hand-tuned asm)
+//   stdlib   — encoding/base64
 
 func BenchmarkEncode(b *testing.B) {
+	em := emmansun.StdEncoding.WithPadding(emmansun.NoPadding)
 	for _, size := range []int{100, 1000, 10000, 65536} {
 		raw := make([]byte, size)
 		rand.Read(raw)
@@ -220,6 +233,13 @@ func BenchmarkEncode(b *testing.B) {
 			b.SetBytes(int64(size))
 			for b.Loop() {
 				RawStdEncoding.Encode(dst, raw)
+			}
+		})
+		b.Run(fmt.Sprintf("emmansun/%d", size), func(b *testing.B) {
+			dst := make([]byte, n)
+			b.SetBytes(int64(size))
+			for b.Loop() {
+				em.Encode(dst, raw)
 			}
 		})
 		b.Run(fmt.Sprintf("stdlib/%d", size), func(b *testing.B) {
@@ -233,6 +253,7 @@ func BenchmarkEncode(b *testing.B) {
 }
 
 func BenchmarkDecode(b *testing.B) {
+	em := emmansun.StdEncoding.WithPadding(emmansun.NoPadding)
 	for _, size := range []int{100, 1000, 10000, 65536} {
 		raw := make([]byte, size)
 		rand.Read(raw)
@@ -244,6 +265,13 @@ func BenchmarkDecode(b *testing.B) {
 			b.SetBytes(int64(len(enc)))
 			for b.Loop() {
 				RawStdEncoding.Decode(dst, enc)
+			}
+		})
+		b.Run(fmt.Sprintf("emmansun/%d", size), func(b *testing.B) {
+			dst := make([]byte, dn)
+			b.SetBytes(int64(len(enc)))
+			for b.Loop() {
+				em.Decode(dst, enc)
 			}
 		})
 		b.Run(fmt.Sprintf("stdlib/%d", size), func(b *testing.B) {
