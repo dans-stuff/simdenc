@@ -11,8 +11,10 @@ import (
 )
 
 const (
+	// StdPadding is the standard base64 padding character ('=').
 	StdPadding rune = '='
-	NoPadding  rune = -1
+	// NoPadding disables padding in the encoding.
+	NoPadding rune = -1
 
 	encodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 	encodeURL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -55,8 +57,11 @@ func (enc Encoding) WithPadding(padding rune) *Encoding {
 	return &enc
 }
 
-func (enc *Encoding) EncodedLen(n int) int  { return enc.base.EncodedLen(n) }
-func (enc *Encoding) DecodedLen(n int) int  { return enc.base.DecodedLen(n) }
+// EncodedLen returns the length in bytes of the base64 encoding of n source bytes.
+func (enc *Encoding) EncodedLen(n int) int { return enc.base.EncodedLen(n) }
+
+// DecodedLen returns the maximum length in bytes of the decoded data given n encoded bytes.
+func (enc *Encoding) DecodedLen(n int) int { return enc.base.DecodedLen(n) }
 
 // Encode encodes src into EncodedLen(len(src)) bytes of dst.
 func (enc *Encoding) Encode(dst, src []byte) {
@@ -212,6 +217,8 @@ func (enc *Encoding) decodeScalar(dst, src []byte, srcOffset int) (int, error) {
 
 // --- Errors ---
 
+// CorruptInputError is returned by Decode when the input contains invalid base64 data.
+// The integer value indicates the byte offset of the first invalid character.
 type CorruptInputError int64
 
 func (e CorruptInputError) Error() string {
