@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package b64simd
+package simdenc
 
 import "simd/archsimd"
 

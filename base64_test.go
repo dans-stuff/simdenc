@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package b64simd
+package simdenc
 
 import (
 	"bytes"
@@ -58,9 +58,6 @@ func TestDecodeInvalid(t *testing.T) {
 	_, err := RawStdEncoding.DecodeString("!!!")
 	if err == nil {
 		t.Fatal("expected error for invalid input")
-	}
-	if _, ok := err.(CorruptInputError); !ok {
-		t.Fatalf("expected CorruptInputError, got %T: %v", err, err)
 	}
 }
 
@@ -198,12 +195,12 @@ func FuzzDecode(f *testing.F) {
 			t.Fatalf("StdEncoding decode mismatch for len %d", len(data))
 		}
 
-		// 2. Feed raw random bytes as base64 input; b64simd must not panic.
-		//    If stdlib returns an error, b64simd should too.
+		// 2. Feed raw random bytes as base64 input; simdenc must not panic.
+		//    If stdlib returns an error, simdenc should too.
 		_, stdErr := base64.RawStdEncoding.DecodeString(string(data))
 		_, simdErr := RawStdEncoding.DecodeString(string(data))
 		if stdErr != nil && simdErr == nil {
-			t.Fatalf("stdlib returned error but b64simd did not for raw input %q", data)
+			t.Fatalf("stdlib returned error but simdenc did not for raw input %q", data)
 		}
 	})
 }

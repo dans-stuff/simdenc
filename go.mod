@@ -1,4 +1,4 @@
-module github.com/dans-stuff/b64simd
+module github.com/dans-stuff/simdenc
 
 go 1.26rc1
 

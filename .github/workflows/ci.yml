@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-amd64:
+    name: amd64 (SIMD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go 1.26rc1
+        run: |
+          curl -sL https://go.dev/dl/go1.26rc1.linux-amd64.tar.gz -o /tmp/go.tar.gz
+          sudo rm -rf /usr/local/go
+          sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      - name: Go version
+        run: go version
+
+      - name: CPU features
+        run: lscpu | grep -i -E 'avx|sse|model name'
+
+      - name: Test
+        run: GOEXPERIMENT=simd go test -v -count=1 ./...
+
+      - name: Fuzz (10s each)
+        run: |
+          GOEXPERIMENT=simd go test -fuzz=FuzzEncode -fuzztime=10s ./...
+          GOEXPERIMENT=simd go test -fuzz=FuzzDecode -fuzztime=10s ./...
+
+      - name: Benchmark
+        run: GOEXPERIMENT=simd go test -bench 'BenchmarkEncode|BenchmarkDecode' -benchtime 500ms -count 1 -run XXX ./...
+
+  test-rosetta:
+    name: amd64 via Rosetta 2
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go 1.26rc1 (amd64)
+        run: |
+          curl -sL https://go.dev/dl/go1.26rc1.darwin-amd64.tar.gz -o /tmp/go.tar.gz
+          sudo rm -rf /usr/local/go
+          sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      - name: Build amd64 test binary
+        run: GOARCH=amd64 GOEXPERIMENT=simd go test -c -o /tmp/simdenc_test ./...
+
+      - name: Run under Rosetta
+        run: arch -x86_64 /tmp/simdenc_test -test.v -test.count=1
+
+  test-arm64:
+    name: arm64 (stdlib fallback)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go 1.26rc1
+        run: |
+          curl -sL https://go.dev/dl/go1.26rc1.darwin-arm64.tar.gz -o /tmp/go.tar.gz
+          sudo rm -rf /usr/local/go
+          sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      - name: Go version
+        run: go version
+
+      - name: Test (stdlib fallback, no SIMD paths)
+        run: GOEXPERIMENT=simd go test -v -count=1 ./...

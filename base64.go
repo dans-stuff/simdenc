@@ -1,9 +1,9 @@
-// Package b64simd implements base64 encoding as specified by RFC 4648,
+// Package simdenc implements base64 encoding as specified by RFC 4648,
 // with optional SIMD acceleration on amd64.
 //
-// The API mirrors encoding/base64 and can serve as a drop-in replacement.
-// On platforms without SIMD support, all operations delegate to encoding/base64.
-package b64simd
+// The API mirrors encoding/base64. On platforms without SIMD support,
+// all operations delegate to encoding/base64.
+package simdenc
 
 import (
 	"encoding/base64"
