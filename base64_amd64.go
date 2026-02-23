@@ -333,51 +333,71 @@ func doEncode(alphabet uint8, dst, src []byte) {
 
 func doDecode(alphabet uint8, dst, src []byte) (int, int) {
 	a := &decAlphas[alphabet]
-
-	nibMask := nibbleMask
-	nibShift := nibbleShift
-	validHi := a.validHi
-	validLo := a.validLo
-	rollTable := a.rollTable
-	specialChar := a.special
-	specialShift := a.shift
-	pairs := combinePairs
-	quads := combineQuads
-
-	// Compaction: VBMI uses single cross-lane permute, AVX2 uses two-step.
-	vbmiExtract := extractVBMI
-	avx2Shuf := extractShuffle
-	avx2Perm := extractPermute
-
 	di, si := 0, 0
-	srcEnd, dstEnd := len(src)-32, len(dst)-32
-	for si <= srcEnd && di <= dstEnd {
-		encoded := archsimd.LoadUint8x32Slice(src[si : si+32])
 
-		hiNib := encoded.AsUint32x8().ShiftRight(nibShift).AsUint8x32().And(nibMask)
-		loNib := encoded.And(nibMask)
-		if !validHi.PermuteOrZeroGrouped(hiNib.AsInt8x32()).And(
-			validLo.PermuteOrZeroGrouped(loNib.AsInt8x32())).IsZero() {
-			break
+	if hasAVX512 {
+		nibMask := nibbleMask
+		nibShift := nibbleShift
+		validHi := a.validHi
+		validLo := a.validLo
+		rollTable := a.rollTable
+		specialChar := a.special
+		specialShift := a.shift
+		pairs := combinePairs
+		quads := combineQuads
+		extract := extractVBMI
+
+		srcEnd, dstEnd := len(src)-32, len(dst)-32
+		for si <= srcEnd && di <= dstEnd {
+			encoded := archsimd.LoadUint8x32Slice(src[si : si+32])
+			hiNib := encoded.AsUint32x8().ShiftRight(nibShift).AsUint8x32().And(nibMask)
+			loNib := encoded.And(nibMask)
+			if !validHi.PermuteOrZeroGrouped(hiNib.AsInt8x32()).And(
+				validLo.PermuteOrZeroGrouped(loNib.AsInt8x32())).IsZero() {
+				break
+			}
+			isSpecial := encoded.Equal(specialChar).ToInt8x32().AsUint8x32().And(specialShift)
+			roll := rollTable.PermuteOrZeroGrouped(hiNib.Add(isSpecial).AsInt8x32())
+			sextets := encoded.Add(roll)
+			twelveBit := sextets.DotProductPairsSaturated(pairs)
+			twentyFourBit := twelveBit.DotProductPairs(quads)
+			result := twentyFourBit.AsUint8x32().Permute(extract)
+			result.StoreSlice(dst[di : di+32])
+			si += 32
+			di += 24
 		}
+	} else {
+		nibMask := nibbleMask
+		nibShift := nibbleShift
+		validHi := a.validHi
+		validLo := a.validLo
+		rollTable := a.rollTable
+		specialChar := a.special
+		specialShift := a.shift
+		pairs := combinePairs
+		quads := combineQuads
+		extractShuf := extractShuffle
+		extractPerm := extractPermute
 
-		isSpecial := encoded.Equal(specialChar).ToInt8x32().AsUint8x32().And(specialShift)
-		roll := rollTable.PermuteOrZeroGrouped(hiNib.Add(isSpecial).AsInt8x32())
-		sextets := encoded.Add(roll)
-
-		twelveBit := sextets.DotProductPairsSaturated(pairs)
-		twentyFourBit := twelveBit.DotProductPairs(quads)
-
-		var result archsimd.Uint8x32
-		if hasAVX512 {
-			result = twentyFourBit.AsUint8x32().Permute(vbmiExtract)
-		} else {
-			result = twentyFourBit.AsUint8x32().PermuteOrZeroGrouped(avx2Shuf).AsUint32x8().Permute(avx2Perm).AsUint8x32()
+		srcEnd, dstEnd := len(src)-32, len(dst)-32
+		for si <= srcEnd && di <= dstEnd {
+			encoded := archsimd.LoadUint8x32Slice(src[si : si+32])
+			hiNib := encoded.AsUint32x8().ShiftRight(nibShift).AsUint8x32().And(nibMask)
+			loNib := encoded.And(nibMask)
+			if !validHi.PermuteOrZeroGrouped(hiNib.AsInt8x32()).And(
+				validLo.PermuteOrZeroGrouped(loNib.AsInt8x32())).IsZero() {
+				break
+			}
+			isSpecial := encoded.Equal(specialChar).ToInt8x32().AsUint8x32().And(specialShift)
+			roll := rollTable.PermuteOrZeroGrouped(hiNib.Add(isSpecial).AsInt8x32())
+			sextets := encoded.Add(roll)
+			twelveBit := sextets.DotProductPairsSaturated(pairs)
+			twentyFourBit := twelveBit.DotProductPairs(quads)
+			result := twentyFourBit.AsUint8x32().PermuteOrZeroGrouped(extractShuf).AsUint32x8().Permute(extractPerm).AsUint8x32()
+			result.StoreSlice(dst[di : di+32])
+			si += 32
+			di += 24
 		}
-
-		result.StoreSlice(dst[di : di+32])
-		si += 32
-		di += 24
 	}
 
 	// Scalar tail.
