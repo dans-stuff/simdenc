@@ -246,7 +246,8 @@ func encode512(a *encodeAlpha, dst, src []byte) (di, si int) {
 		w := grouped.AsUint16x32()
 		sextets := w.And(encMaskHi512).MulHigh(encShiftHi512).Or(w.And(encMaskLo512).Mul(encShiftLo512)).AsUint8x64()
 		result := sextets.Add(asciiTable512.Permute(sextets))
-		result.StoreSlice(dst[di : di+64])
+		d := dst[di:]
+		result.StoreSlice(d[:64])
 		si += 48
 		di += 64
 	}
@@ -282,7 +283,8 @@ func doEncode(alphabet uint8, dst, src []byte) {
 			sextets := w.And(encSextetMaskHi).MulHigh(encSextetShiftHi).Or(w.And(encSextetMaskLo).Mul(encSextetShiftLo)).AsUint8x32()
 			asciiOffset := asciiTableLo.ConcatPermute(asciiTableHi, sextets)
 			result := sextets.Add(asciiOffset)
-			result.StoreSlice(dst[di : di+32])
+			d := dst[di:]
+			result.StoreSlice(d[:32])
 			si += 24
 			di += 32
 		}
@@ -315,7 +317,8 @@ func doEncode(alphabet uint8, dst, src []byte) {
 				rangeIdx := saturated.Sub(pastUpper)
 				asciiOffset := sextetToAscii.PermuteOrZeroGrouped(rangeIdx.AsInt8x32())
 				result := sextets.Add(asciiOffset)
-				result.StoreSlice(dst[di : di+32])
+				d := dst[di:]
+				result.StoreSlice(d[:32])
 				si += 24
 				di += 32
 			}
