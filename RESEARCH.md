@@ -830,6 +830,54 @@ misprediction effects or compiler scheduling differences around the if/else.
 for the SIMD loop. The scalar tail adds ~30 lines of code that the compiler must account for
 in its allocation decisions, even though it rarely executes.
 
+## Experiment 26: Branch Inside SIMD Loop Costs 8-9% — KEY FINDING
+
+**Hypothesis:** The 12% regression in unified decode (vs separate functions) comes from the
+`if useVBMI { VPERMB } else { VPSHUFB+VPERMD }` branch inside the hot loop.
+
+**Test:** Remove the branch entirely, hardcoding VPERMB compaction (VBMI-only).
+Same 10 hoisted variables, same function structure, just no branch.
+
+**Results (AMD EPYC, GB/s, decode):**
+| Config | 1KB | 10KB | 64KB |
+|---|---|---|---|
+| Separate funcs (baseline) | 18.7 | — | 24.6 |
+| Unified + branch | 17.1 | 21.2 | 21.7 |
+| Branch-free | 18.5 | 23.2 | 23.6 |
+| Branch-free + `d := dst[di:]` reslice | **19.3** | **24.3** | **24.3** |
+
+**Analysis:**
+- Removing the branch recovered 8-9% (21.7 → 23.6 at 64KB)
+- Adding the reslice trick recovered another 3% (23.6 → 24.3)
+- Combined: within 1% of the separate-function baseline
+
+**Why does a perfectly-predicted branch cost 8-9%?**
+The branch predictor handles the always-taken path at near-zero cost, but the branch
+still disrupts the compiler's code generation:
+1. **Dead code in the binary:** The AVX2 fallback path (2 memory loads + VPSHUFB + VPERMD)
+   is generated even on VBMI machines. This occupies instruction cache uselessly.
+2. **Phi node register pressure:** `var result` declared before the branch creates a phi
+   node that the compiler must schedule around, potentially forcing a register spill.
+3. **Scheduling disruption:** The TESTB+JEQ between VPMADDWD and VPERMB prevents the
+   compiler from scheduling them back-to-back for optimal pipeline utilization.
+4. **Function size:** 371 bytes with branch vs 326 bytes without = 12% larger instruction footprint.
+
+**Assembly comparison:**
+| Metric | With branch | Branch-free |
+|---|---|---|
+| Function size | 371 bytes | 326 bytes |
+| YMM registers | 14 (Y0-Y13) | 14 (Y0-Y13) |
+| Stack spills | 0 | 0 |
+| Instructions in loop | ~25 + branch | ~22 |
+
+**Verdict:** Even perfectly-predicted branches are expensive inside SIMD loops.
+For the primary VBMI target, use a branch-free decode. For AVX2-only fallback,
+dispatch to a separate function before entering the loop (not inside it).
+
+**Implication for code organization:** Instead of a single function with an internal
+branch, use two function bodies (VBMI and AVX2) selected by the dispatcher. This
+matches the performance of separate functions while keeping the dispatch logic clean.
+
 ## Summary of Hoisting Approaches Tested
 
 | Approach | Intrinsics inlined? | Constants hoisted? | Performance | Verdict |
