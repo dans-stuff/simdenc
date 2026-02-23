@@ -344,7 +344,6 @@ func doEncode(alphabet uint8, dst, src []byte) {
 func decode(alphabet uint8, dst, src []byte) (int, int) {
 	a := &decAlphas[alphabet]
 	di, si := 0, 0
-	useVBMI := hasAVX512
 
 	nibbleMask := nibbleMask
 	nibbleShift := nibbleShift
@@ -371,13 +370,9 @@ func decode(alphabet uint8, dst, src []byte) (int, int) {
 		sextets := encoded.Add(roll)
 		twelveBit := sextets.DotProductPairsSaturated(combinePairs)
 		twentyFourBit := twelveBit.DotProductPairs(combineQuads)
-		var result archsimd.Uint8x32
-		if useVBMI {
-			result = twentyFourBit.AsUint8x32().Permute(extractVBMI)
-		} else {
-			result = twentyFourBit.AsUint8x32().PermuteOrZeroGrouped(extractShuffle).AsUint32x8().Permute(extractPermute).AsUint8x32()
-		}
-		result.StoreSlice(dst[di : di+32])
+		result := twentyFourBit.AsUint8x32().Permute(extractVBMI)
+		d := dst[di:]
+		result.StoreSlice(d[:32])
 		si += 32
 		di += 24
 	}
