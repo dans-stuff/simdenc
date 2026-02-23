@@ -227,35 +227,46 @@ func initAlphabet(idx uint8, alphabet string, specialChar, enc62, enc63, special
 
 // --- Encode ---
 
+func encode512(a *encodeAlpha, dst, src []byte) (di, si int) {
+	srcEnd := len(src) - 64
+	dstEnd := len(dst) - 64
+	if srcEnd < 0 || dstEnd < 0 {
+		return 0, 0
+	}
+
+	shuffle := encShuffle512
+	maskHi := encMaskHi512
+	shiftHi := encShiftHi512
+	maskLo := encMaskLo512
+	shiftLo := encShiftLo512
+	asciiTable := a.asciiTable512
+
+	for si <= srcEnd && di <= dstEnd {
+		grouped := archsimd.LoadUint8x64Slice(src[si : si+64]).Permute(shuffle)
+		w := grouped.AsUint16x32()
+		sextets := w.And(maskHi).MulHigh(shiftHi).Or(w.And(maskLo).Mul(shiftLo)).AsUint8x64()
+		result := sextets.Add(asciiTable.Permute(sextets))
+		result.StoreSlice(dst[di : di+64])
+		si += 48
+		di += 64
+	}
+	return di, si
+}
+
 func doEncode(alphabet uint8, dst, src []byte) {
 	a := &encAlphas[alphabet]
 	n := len(src)
 	di, si := 0, 0
 	alpha := a.alphabet
 
-	// Stage 1: AVX-512 (48 bytes/iter).
-	if hasAVX512 && n >= 64 {
-		shuffle := encShuffle512
-		maskHi := encMaskHi512
-		shiftHi := encShiftHi512
-		maskLo := encMaskLo512
-		shiftLo := encShiftLo512
-		asciiTable := a.asciiTable512
-
-		srcEnd, dstEnd := n-64, len(dst)-64
-		for si <= srcEnd && di <= dstEnd {
-			grouped := archsimd.LoadUint8x64Slice(src[si : si+64]).Permute(shuffle)
-			w := grouped.AsUint16x32()
-			sextets := w.And(maskHi).MulHigh(shiftHi).Or(w.And(maskLo).Mul(shiftLo)).AsUint8x64()
-			result := sextets.Add(asciiTable.Permute(sextets))
-			result.StoreSlice(dst[di : di+64])
-			si += 48
-			di += 64
-		}
+	// Stage 1: AVX-512 bulk (separate function for register pressure).
+	if hasAVX512 {
+		di, si = encode512(a, dst, src)
 	}
 
-	// Stage 2: VBMI 256-bit (24 bytes/iter, cross-lane).
-	if hasAVX512 && n-si >= 32 {
+	// Stage 2: 256-bit cleanup.
+	if hasAVX512 {
+		// VBMI: cross-lane shuffle, no offset trick needed.
 		shuffle := encCrossLaneShuffle
 		maskHi := encSextetMaskHi
 		shiftHi := encSextetShiftHi
@@ -264,7 +275,7 @@ func doEncode(alphabet uint8, dst, src []byte) {
 		tableLo := a.asciiTableLo
 		tableHi := a.asciiTableHi
 
-		srcEnd, dstEnd := len(src)-32, len(dst)-32
+		srcEnd, dstEnd := n-32, len(dst)-32
 		for si <= srcEnd && di <= dstEnd {
 			grouped := archsimd.LoadUint8x32Slice(src[si : si+32]).Permute(shuffle)
 			w := grouped.AsUint16x16()
@@ -275,40 +286,39 @@ func doEncode(alphabet uint8, dst, src []byte) {
 			si += 24
 			di += 32
 		}
-	}
+	} else {
+		// AVX2: lane-local shuffle with -4 offset load trick.
+		if n >= 34 {
+			for i := 0; i < 2; i++ {
+				v := uint(src[3*i])<<16 | uint(src[3*i+1])<<8 | uint(src[3*i+2])
+				dst[4*i], dst[4*i+1], dst[4*i+2], dst[4*i+3] = alpha[v>>18&0x3F], alpha[v>>12&0x3F], alpha[v>>6&0x3F], alpha[v&0x3F]
+			}
+			si = 6
+			di = 8
 
-	// Stage 2 (AVX2 fallback): offset-load trick (24 bytes/iter, lane-local).
-	if !hasAVX512 && n >= 34 {
-		// Scalar preamble: encode 2 triplets so si >= 4 for the offset load.
-		for i := 0; i < 2; i++ {
-			v := uint(src[3*i])<<16 | uint(src[3*i+1])<<8 | uint(src[3*i+2])
-			dst[4*i], dst[4*i+1], dst[4*i+2], dst[4*i+3] = alpha[v>>18&0x3F], alpha[v>>12&0x3F], alpha[v>>6&0x3F], alpha[v&0x3F]
-		}
-		si = 6
-		di = 8
+			shuffle := encOffsetShuffle
+			maskHi := encSextetMaskHi
+			shiftHi := encSextetShiftHi
+			maskLo := encSextetMaskLo
+			shiftLo := encSextetShiftLo
+			lastLower := encLastLowerSextet
+			lastUpper := encLastUpperSextet
+			sextetToAscii := a.sextetToAscii
 
-		shuffle := encOffsetShuffle
-		maskHi := encSextetMaskHi
-		shiftHi := encSextetShiftHi
-		maskLo := encSextetMaskLo
-		shiftLo := encSextetShiftLo
-		lastLower := encLastLowerSextet
-		lastUpper := encLastUpperSextet
-		sextetToAscii := a.sextetToAscii
-
-		srcEnd, dstEnd := len(src)-32, len(dst)-32
-		for si <= srcEnd && di <= dstEnd {
-			grouped := archsimd.LoadUint8x32Slice(src[si-4 : si+28]).PermuteOrZeroGrouped(shuffle)
-			w := grouped.AsUint16x16()
-			sextets := w.And(maskHi).MulHigh(shiftHi).Or(w.And(maskLo).Mul(shiftLo)).AsUint8x32()
-			saturated := sextets.SubSaturated(lastLower)
-			pastUpper := sextets.AsInt8x32().Greater(lastUpper).ToInt8x32().AsUint8x32()
-			rangeIdx := saturated.Sub(pastUpper)
-			asciiOffset := sextetToAscii.PermuteOrZeroGrouped(rangeIdx.AsInt8x32())
-			result := sextets.Add(asciiOffset)
-			result.StoreSlice(dst[di : di+32])
-			si += 24
-			di += 32
+			srcEnd, dstEnd := n-32, len(dst)-32
+			for si <= srcEnd && di <= dstEnd {
+				grouped := archsimd.LoadUint8x32Slice(src[si-4 : si+28]).PermuteOrZeroGrouped(shuffle)
+				w := grouped.AsUint16x16()
+				sextets := w.And(maskHi).MulHigh(shiftHi).Or(w.And(maskLo).Mul(shiftLo)).AsUint8x32()
+				saturated := sextets.SubSaturated(lastLower)
+				pastUpper := sextets.AsInt8x32().Greater(lastUpper).ToInt8x32().AsUint8x32()
+				rangeIdx := saturated.Sub(pastUpper)
+				asciiOffset := sextetToAscii.PermuteOrZeroGrouped(rangeIdx.AsInt8x32())
+				result := sextets.Add(asciiOffset)
+				result.StoreSlice(dst[di : di+32])
+				si += 24
+				di += 32
+			}
 		}
 	}
 
