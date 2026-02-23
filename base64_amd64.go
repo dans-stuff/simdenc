@@ -341,7 +341,7 @@ func doEncode(alphabet uint8, dst, src []byte) {
 
 // --- Decode ---
 
-func doDecode(alphabet uint8, dst, src []byte) (int, int) {
+func decode(alphabet uint8, dst, src []byte) (int, int) {
 	a := &decAlphas[alphabet]
 	di, si := 0, 0
 	useVBMI := hasAVX512
@@ -356,7 +356,6 @@ func doDecode(alphabet uint8, dst, src []byte) (int, int) {
 	pairs := combinePairs
 	quads := combineQuads
 	vbmiExtract := extractVBMI
-	_ = vbmiExtract // used below
 
 	srcEnd, dstEnd := len(src)-32, len(dst)-32
 	for si <= srcEnd && di <= dstEnd {
@@ -382,9 +381,14 @@ func doDecode(alphabet uint8, dst, src []byte) (int, int) {
 		si += 32
 		di += 24
 	}
+	return di, si
+}
+
+func doDecode(alphabet uint8, dst, src []byte) (int, int) {
+	di, si := decode(alphabet, dst, src)
 
 	// Scalar tail.
-	table := a.decTable
+	table := decAlphas[alphabet].decTable
 	for si+3 < len(src) {
 		va, vb, vc, vd := table[src[si]], table[src[si+1]], table[src[si+2]], table[src[si+3]]
 		if (va|vb|vc|vd)&0x80 != 0 {
