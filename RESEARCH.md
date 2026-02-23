@@ -773,6 +773,63 @@ limitation, distinct from LICM.
 **Verdict:** Separate per-tier functions are the only way to get full performance. The hybrid
 approach is a middle ground but still loses 15-19% at large sizes.
 
+## Experiment 24: Selective Hoisting — Not All Variables Need It
+
+**Hypothesis:** Variables used late in the loop's dependency chain may not need hoisting —
+the load latency gets masked by preceding computation.
+
+**Test:** Starting from a unified decode function (10 hoisted SIMD vectors, scalar tail in
+separate function), systematically un-hoist variables and measure impact.
+
+**Results (AMD EPYC, GB/s, decode):**
+
+| Config | Hoisted | 1KB | 10KB | 64KB |
+|---|---|---|---|---|
+| All hoisted | 10 | 17.1 | 21.2 | 21.7 |
+| No extractVBMI | 9 | 16.9 | 21.2 | 21.6 |
+| No combineQuads | 9 | 17.2 | 21.9 | 21.1 |
+| No quads + no extractVBMI | 8 | 16.4 | 20.5 | 20.1 |
+| No special + shift + extractVBMI | 7 | 14.5 | 18.1 | 18.3 |
+
+**Key findings:**
+1. **Late-pipeline variables can stay as globals at zero cost.** `extractVBMI` (VPERMB at end)
+   and `combineQuads` (VPMADDWD after VPMADDUBSW) each cost 0-2% when un-hoisted individually.
+   Their load latency is hidden behind the chain of preceding SIMD operations.
+2. **Mid-pipeline variables must be hoisted.** `a.special` and `a.shift` (VPCMPEQB + VPAND,
+   used in the middle of the pipeline) cost 16% when un-hoisted. The load competes with
+   active computation.
+3. **Non-linear interaction.** Un-hoisting both late-pipeline vars together costs 7%, while
+   each individually costs ~0%. The two loads compete for memory bandwidth or pipeline slots.
+4. **Heuristic:** Hoist variables used before or during the longest dependency chain. Variables
+   used only after the chain completes (last 1-2 operations before store) may not need hoisting.
+
+### Assembly analysis (decode, 10 hoisted, VBMI path)
+
+- Function size: 371 bytes, `locals=0x8` (zero SIMD stack spills)
+- Register allocation: Y0-Y9 for constants, Y10-Y13 for temporaries (14/16 YMM used)
+- VBMI branch: `TESTB DL, DL / JEQ / VPERMB / JMP` — 4 instructions
+- AVX2 fallback: loads extractShuffle/extractPermute from memory (cold path, un-hoisted)
+- Only CALLs: `runtime.panicBounds` (bounds check failures, never taken in valid input)
+
+Despite zero spills and clean register allocation, this unified function still runs 12% slower
+than the separate-function baseline. The regression source is unclear — possibly branch
+misprediction effects or compiler scheduling differences around the if/else.
+
+## Experiment 25: Scalar Tail Separation
+
+**Test:** Move the scalar decode tail from inside the SIMD function to a separate dispatcher.
+
+**Results (AMD EPYC, GB/s, decode):**
+| Size | Inline tail | Separate tail | Delta |
+|---|---|---|---|
+| 1KB | 16.8 | 17.1 | +2% |
+| 10KB | 20.0 | 21.2 | +6% |
+| 64KB | 20.6 | 21.7 | +5% |
+
+**Verdict:** Separating the scalar tail reduces function body size, improving register allocation
+for the SIMD loop. The scalar tail adds ~30 lines of code that the compiler must account for
+in its allocation decisions, even though it rarely executes.
+
 ## Summary of Hoisting Approaches Tested
 
 | Approach | Intrinsics inlined? | Constants hoisted? | Performance | Verdict |

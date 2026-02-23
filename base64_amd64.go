@@ -234,18 +234,18 @@ func encode512(a *encodeAlpha, dst, src []byte) (di, si int) {
 		return 0, 0
 	}
 
-	shuffle := encShuffle512
-	maskHi := encMaskHi512
-	shiftHi := encShiftHi512
-	maskLo := encMaskLo512
-	shiftLo := encShiftLo512
-	asciiTable := a.asciiTable512
+	encShuffle512 := encShuffle512
+	encMaskHi512 := encMaskHi512
+	encShiftHi512 := encShiftHi512
+	encMaskLo512 := encMaskLo512
+	encShiftLo512 := encShiftLo512
+	asciiTable512 := a.asciiTable512
 
 	for si <= srcEnd && di <= dstEnd {
-		grouped := archsimd.LoadUint8x64Slice(src[si : si+64]).Permute(shuffle)
+		grouped := archsimd.LoadUint8x64Slice(src[si : si+64]).Permute(encShuffle512)
 		w := grouped.AsUint16x32()
-		sextets := w.And(maskHi).MulHigh(shiftHi).Or(w.And(maskLo).Mul(shiftLo)).AsUint8x64()
-		result := sextets.Add(asciiTable.Permute(sextets))
+		sextets := w.And(encMaskHi512).MulHigh(encShiftHi512).Or(w.And(encMaskLo512).Mul(encShiftLo512)).AsUint8x64()
+		result := sextets.Add(asciiTable512.Permute(sextets))
 		result.StoreSlice(dst[di : di+64])
 		si += 48
 		di += 64
@@ -267,20 +267,20 @@ func doEncode(alphabet uint8, dst, src []byte) {
 	// Stage 2: 256-bit cleanup.
 	if hasAVX512 {
 		// VBMI: cross-lane shuffle, no offset trick needed.
-		shuffle := encCrossLaneShuffle
-		maskHi := encSextetMaskHi
-		shiftHi := encSextetShiftHi
-		maskLo := encSextetMaskLo
-		shiftLo := encSextetShiftLo
-		tableLo := a.asciiTableLo
-		tableHi := a.asciiTableHi
+		encCrossLaneShuffle := encCrossLaneShuffle
+		encSextetMaskHi := encSextetMaskHi
+		encSextetShiftHi := encSextetShiftHi
+		encSextetMaskLo := encSextetMaskLo
+		encSextetShiftLo := encSextetShiftLo
+		asciiTableLo := a.asciiTableLo
+		asciiTableHi := a.asciiTableHi
 
 		srcEnd, dstEnd := n-32, len(dst)-32
 		for si <= srcEnd && di <= dstEnd {
-			grouped := archsimd.LoadUint8x32Slice(src[si : si+32]).Permute(shuffle)
+			grouped := archsimd.LoadUint8x32Slice(src[si : si+32]).Permute(encCrossLaneShuffle)
 			w := grouped.AsUint16x16()
-			sextets := w.And(maskHi).MulHigh(shiftHi).Or(w.And(maskLo).Mul(shiftLo)).AsUint8x32()
-			asciiOffset := tableLo.ConcatPermute(tableHi, sextets)
+			sextets := w.And(encSextetMaskHi).MulHigh(encSextetShiftHi).Or(w.And(encSextetMaskLo).Mul(encSextetShiftLo)).AsUint8x32()
+			asciiOffset := asciiTableLo.ConcatPermute(asciiTableHi, sextets)
 			result := sextets.Add(asciiOffset)
 			result.StoreSlice(dst[di : di+32])
 			si += 24
@@ -296,22 +296,22 @@ func doEncode(alphabet uint8, dst, src []byte) {
 			si = 6
 			di = 8
 
-			shuffle := encOffsetShuffle
-			maskHi := encSextetMaskHi
-			shiftHi := encSextetShiftHi
-			maskLo := encSextetMaskLo
-			shiftLo := encSextetShiftLo
-			lastLower := encLastLowerSextet
-			lastUpper := encLastUpperSextet
+			encOffsetShuffle := encOffsetShuffle
+			encSextetMaskHi := encSextetMaskHi
+			encSextetShiftHi := encSextetShiftHi
+			encSextetMaskLo := encSextetMaskLo
+			encSextetShiftLo := encSextetShiftLo
+			encLastLowerSextet := encLastLowerSextet
+			encLastUpperSextet := encLastUpperSextet
 			sextetToAscii := a.sextetToAscii
 
 			srcEnd, dstEnd := n-32, len(dst)-32
 			for si <= srcEnd && di <= dstEnd {
-				grouped := archsimd.LoadUint8x32Slice(src[si-4 : si+28]).PermuteOrZeroGrouped(shuffle)
+				grouped := archsimd.LoadUint8x32Slice(src[si-4 : si+28]).PermuteOrZeroGrouped(encOffsetShuffle)
 				w := grouped.AsUint16x16()
-				sextets := w.And(maskHi).MulHigh(shiftHi).Or(w.And(maskLo).Mul(shiftLo)).AsUint8x32()
-				saturated := sextets.SubSaturated(lastLower)
-				pastUpper := sextets.AsInt8x32().Greater(lastUpper).ToInt8x32().AsUint8x32()
+				sextets := w.And(encSextetMaskHi).MulHigh(encSextetShiftHi).Or(w.And(encSextetMaskLo).Mul(encSextetShiftLo)).AsUint8x32()
+				saturated := sextets.SubSaturated(encLastLowerSextet)
+				pastUpper := sextets.AsInt8x32().Greater(encLastUpperSextet).ToInt8x32().AsUint8x32()
 				rangeIdx := saturated.Sub(pastUpper)
 				asciiOffset := sextetToAscii.PermuteOrZeroGrouped(rangeIdx.AsInt8x32())
 				result := sextets.Add(asciiOffset)
@@ -346,34 +346,34 @@ func decode(alphabet uint8, dst, src []byte) (int, int) {
 	di, si := 0, 0
 	useVBMI := hasAVX512
 
-	nibMask := nibbleMask
-	nibShift := nibbleShift
+	nibbleMask := nibbleMask
+	nibbleShift := nibbleShift
 	validHi := a.validHi
 	validLo := a.validLo
 	rollTable := a.rollTable
-	specialChar := a.special
-	specialShift := a.shift
-	pairs := combinePairs
-	quads := combineQuads
-	vbmiExtract := extractVBMI
+	special := a.special
+	shift := a.shift
+	combinePairs := combinePairs
+	combineQuads := combineQuads
+	extractVBMI := extractVBMI
 
 	srcEnd, dstEnd := len(src)-32, len(dst)-32
 	for si <= srcEnd && di <= dstEnd {
 		encoded := archsimd.LoadUint8x32Slice(src[si : si+32])
-		hiNib := encoded.AsUint32x8().ShiftRight(nibShift).AsUint8x32().And(nibMask)
-		loNib := encoded.And(nibMask)
+		hiNib := encoded.AsUint32x8().ShiftRight(nibbleShift).AsUint8x32().And(nibbleMask)
+		loNib := encoded.And(nibbleMask)
 		if !validHi.PermuteOrZeroGrouped(hiNib.AsInt8x32()).And(
 			validLo.PermuteOrZeroGrouped(loNib.AsInt8x32())).IsZero() {
 			break
 		}
-		isSpecial := encoded.Equal(specialChar).ToInt8x32().AsUint8x32().And(specialShift)
+		isSpecial := encoded.Equal(special).ToInt8x32().AsUint8x32().And(shift)
 		roll := rollTable.PermuteOrZeroGrouped(hiNib.Add(isSpecial).AsInt8x32())
 		sextets := encoded.Add(roll)
-		twelveBit := sextets.DotProductPairsSaturated(pairs)
-		twentyFourBit := twelveBit.DotProductPairs(quads)
+		twelveBit := sextets.DotProductPairsSaturated(combinePairs)
+		twentyFourBit := twelveBit.DotProductPairs(combineQuads)
 		var result archsimd.Uint8x32
 		if useVBMI {
-			result = twentyFourBit.AsUint8x32().Permute(vbmiExtract)
+			result = twentyFourBit.AsUint8x32().Permute(extractVBMI)
 		} else {
 			result = twentyFourBit.AsUint8x32().PermuteOrZeroGrouped(extractShuffle).AsUint32x8().Permute(extractPermute).AsUint8x32()
 		}
