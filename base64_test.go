@@ -9,48 +9,46 @@ import (
 	"fmt"
 	"testing"
 
+	cristalhq "github.com/cristalhq/base64"
 	emmansun "github.com/emmansun/base64"
 )
 
 // --- Correctness ---
 
-func TestRoundtrip(t *testing.T) {
-	for _, n := range []int{0, 1, 2, 3, 4, 12, 13, 15, 16, 24, 36, 48, 100, 1000, 4096} {
-		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
-			src := randbytes(t, n)
-			encoded := RawStdEncoding.EncodeToString(src)
-			want := base64.RawStdEncoding.EncodeToString(src)
-			if encoded != want {
-				t.Fatalf("encode mismatch:\n  got:  %q\n  want: %q", encoded, want)
-			}
-			decoded, err := RawStdEncoding.DecodeString(encoded)
-			if err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if !bytes.Equal(decoded, src) {
-				t.Fatal("roundtrip mismatch")
-			}
-		})
-	}
+// encodingPair pairs a simdenc encoding with its stdlib equivalent.
+type encodingPair struct {
+	name string
+	enc  *Encoding
+	std  *base64.Encoding
 }
 
-func TestPaddedRoundtrip(t *testing.T) {
-	for _, n := range []int{0, 1, 2, 3, 4, 12, 24, 100} {
-		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
-			src := randbytes(t, n)
-			encoded := StdEncoding.EncodeToString(src)
-			want := base64.StdEncoding.EncodeToString(src)
-			if encoded != want {
-				t.Fatalf("padded encode mismatch:\n  got:  %q\n  want: %q", encoded, want)
-			}
-			decoded, err := StdEncoding.DecodeString(encoded)
-			if err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if !bytes.Equal(decoded, src) {
-				t.Fatal("padded roundtrip mismatch")
-			}
-		})
+var allEncodings = []encodingPair{
+	{"RawStd", RawStdEncoding, base64.RawStdEncoding},
+	{"Std", StdEncoding, base64.StdEncoding},
+	{"RawURL", RawURLEncoding, base64.RawURLEncoding},
+	{"URL", URLEncoding, base64.URLEncoding},
+}
+
+func TestRoundtrip(t *testing.T) {
+	sizes := []int{0, 1, 2, 3, 4, 12, 13, 15, 16, 24, 36, 48, 100, 1000, 4096}
+	for _, e := range allEncodings {
+		for _, n := range sizes {
+			t.Run(fmt.Sprintf("%s/n=%d", e.name, n), func(t *testing.T) {
+				src := randbytes(t, n)
+				encoded := e.enc.EncodeToString(src)
+				want := e.std.EncodeToString(src)
+				if encoded != want {
+					t.Fatalf("encode mismatch:\n  got:  %q\n  want: %q", encoded, want)
+				}
+				decoded, err := e.enc.DecodeString(encoded)
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if !bytes.Equal(decoded, src) {
+					t.Fatal("roundtrip mismatch")
+				}
+			})
+		}
 	}
 }
 
@@ -58,22 +56,6 @@ func TestDecodeInvalid(t *testing.T) {
 	_, err := RawStdEncoding.DecodeString("!!!")
 	if err == nil {
 		t.Fatal("expected error for invalid input")
-	}
-}
-
-func TestDecodeAgainstStdlib(t *testing.T) {
-	for _, n := range []int{16, 32, 64, 128, 256, 1024} {
-		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
-			raw := randbytes(t, n)
-			encoded := base64.RawStdEncoding.EncodeToString(raw)
-			decoded, err := RawStdEncoding.DecodeString(encoded)
-			if err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if !bytes.Equal(decoded, raw) {
-				t.Fatalf("mismatch at size %d", n)
-			}
-		})
 	}
 }
 
@@ -152,18 +134,12 @@ func FuzzEncode(f *testing.F) {
 	f.Add(randfuzz(1000))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Raw (no padding)
-		gotRaw := RawStdEncoding.EncodeToString(data)
-		wantRaw := base64.RawStdEncoding.EncodeToString(data)
-		if gotRaw != wantRaw {
-			t.Fatalf("RawStdEncoding mismatch for len %d:\n  got:  %q\n  want: %q", len(data), gotRaw, wantRaw)
-		}
-
-		// Padded
-		gotPad := StdEncoding.EncodeToString(data)
-		wantPad := base64.StdEncoding.EncodeToString(data)
-		if gotPad != wantPad {
-			t.Fatalf("StdEncoding mismatch for len %d:\n  got:  %q\n  want: %q", len(data), gotPad, wantPad)
+		for _, e := range allEncodings {
+			got := e.enc.EncodeToString(data)
+			want := e.std.EncodeToString(data)
+			if got != want {
+				t.Fatalf("%s mismatch for len %d:\n  got:  %q\n  want: %q", e.name, len(data), got, want)
+			}
 		}
 	})
 }
@@ -176,27 +152,18 @@ func FuzzDecode(f *testing.F) {
 	f.Add(randfuzz(1000))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// 1. Encode with stdlib, decode with both, compare.
-		encodedRaw := base64.RawStdEncoding.EncodeToString(data)
-		gotRaw, err := RawStdEncoding.DecodeString(encodedRaw)
-		if err != nil {
-			t.Fatalf("RawStdEncoding decode of valid input failed: %v", err)
-		}
-		if !bytes.Equal(gotRaw, data) {
-			t.Fatalf("RawStdEncoding decode mismatch for len %d", len(data))
-		}
-
-		encodedPad := base64.StdEncoding.EncodeToString(data)
-		gotPad, err := StdEncoding.DecodeString(encodedPad)
-		if err != nil {
-			t.Fatalf("StdEncoding decode of valid input failed: %v", err)
-		}
-		if !bytes.Equal(gotPad, data) {
-			t.Fatalf("StdEncoding decode mismatch for len %d", len(data))
+		for _, e := range allEncodings {
+			encoded := e.std.EncodeToString(data)
+			got, err := e.enc.DecodeString(encoded)
+			if err != nil {
+				t.Fatalf("%s decode of valid input failed: %v", e.name, err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatalf("%s decode mismatch for len %d", e.name, len(data))
+			}
 		}
 
-		// 2. Feed raw random bytes as base64 input; simdenc must not panic.
-		//    If stdlib returns an error, simdenc should too.
+		// Feed raw random bytes as base64 input; simdenc must not panic.
 		_, stdErr := base64.RawStdEncoding.DecodeString(string(data))
 		_, simdErr := RawStdEncoding.DecodeString(string(data))
 		if stdErr != nil && simdErr == nil {
@@ -213,14 +180,16 @@ func randfuzz(n int) []byte {
 
 // --- Benchmarks ---
 //
-// Three implementations compared at each size:
-//   simd     — production path (best available SIMD tier, or stdlib fallback)
-//   emmansun — github.com/emmansun/base64 (AVX2, hand-tuned asm)
-//   stdlib   — encoding/base64
+// Four implementations compared at each size:
+//   simd      — production path (best available SIMD tier, or stdlib fallback)
+//   emmansun  — github.com/emmansun/base64 (AVX2, hand-tuned asm)
+//   cristalhq — github.com/cristalhq/base64 (pure Go, Turbo-Base64 port)
+//   stdlib    — encoding/base64
 
 func BenchmarkEncode(b *testing.B) {
 	em := emmansun.StdEncoding.WithPadding(emmansun.NoPadding)
-	for _, size := range []int{100, 1000, 10000, 65536} {
+	cr := cristalhq.RawStdEncoding
+	for _, size := range []int{3, 12, 24, 48, 64, 100, 128, 256, 1000, 10000, 65536} {
 		raw := make([]byte, size)
 		rand.Read(raw)
 		n := RawStdEncoding.EncodedLen(size)
@@ -239,6 +208,13 @@ func BenchmarkEncode(b *testing.B) {
 				em.Encode(dst, raw)
 			}
 		})
+		b.Run(fmt.Sprintf("cristalhq/%d", size), func(b *testing.B) {
+			dst := make([]byte, n)
+			b.SetBytes(int64(size))
+			for b.Loop() {
+				cr.Encode(dst, raw)
+			}
+		})
 		b.Run(fmt.Sprintf("stdlib/%d", size), func(b *testing.B) {
 			dst := make([]byte, n)
 			b.SetBytes(int64(size))
@@ -251,7 +227,8 @@ func BenchmarkEncode(b *testing.B) {
 
 func BenchmarkDecode(b *testing.B) {
 	em := emmansun.StdEncoding.WithPadding(emmansun.NoPadding)
-	for _, size := range []int{100, 1000, 10000, 65536} {
+	cr := cristalhq.RawStdEncoding
+	for _, size := range []int{64, 100, 128, 256, 1000, 10000, 65536} {
 		raw := make([]byte, size)
 		rand.Read(raw)
 		enc := []byte(base64.RawStdEncoding.EncodeToString(raw))
@@ -269,6 +246,13 @@ func BenchmarkDecode(b *testing.B) {
 			b.SetBytes(int64(len(enc)))
 			for b.Loop() {
 				em.Decode(dst, enc)
+			}
+		})
+		b.Run(fmt.Sprintf("cristalhq/%d", size), func(b *testing.B) {
+			dst := make([]byte, dn)
+			b.SetBytes(int64(len(enc)))
+			for b.Loop() {
+				cr.Decode(dst, enc)
 			}
 		})
 		b.Run(fmt.Sprintf("stdlib/%d", size), func(b *testing.B) {

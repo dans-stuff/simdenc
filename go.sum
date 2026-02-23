@@ -1,3 +1,5 @@
+github.com/cristalhq/base64 v0.1.2 h1:edsefYyYDiac7Ytdh2xdaiiSSJzcI2f0yIkdGEf1qY0=
+github.com/cristalhq/base64 v0.1.2/go.mod h1:sy4+2Hale2KbtSqkzpdMeYTP/IrB+HCvxVHWsh2VSYk=
 github.com/emmansun/base64 v0.8.0 h1:HSF5Yj8x7xAWeXG9nWesAflFTi5d9o1wlqhIGjvF1n8=
 github.com/emmansun/base64 v0.8.0/go.mod h1:IYGtqjG0NQwY+3EgUiDjDEXbFq9nFJ/W9fqDzkFcxPk=
 golang.org/x/sys v0.38.0 h1:3yZWxaJjBmCWXqhN1qh02AkOnCQ1poK6oF+a7xWL6Gc=
