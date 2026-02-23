@@ -742,6 +742,37 @@ func alt16(even, odd uint16) archsimd.Uint16x16 {
 
 **Verdict: KEEP.** Cleaner init code, no byte arrays for simple patterns.
 
+## Experiment 23: Monolithic Function Body Size — KEY FINDING
+
+**Hypothesis:** The 40-55% regression from by-value struct args (experiment 21 at scale) was caused
+by copying large structs. Testing on branch `monolithic-experiment`.
+
+**Experiments (AMD EPYC, GB/s):**
+
+| Approach | Encode 64KB | Decode 64KB | Notes |
+|---|---|---|---|
+| Separate per-tier functions (baseline) | 35.1 | 24.6 | 5 functions, 482 lines |
+| Fully monolithic, shared hoist at top | 19.1 (-46%) | 17.0 (-31%) | Individual `v := global` hoisting |
+| Fully monolithic, branched hoist | 18.0 (-49%) | 20.8 (-15%) | Constants inside if/else branches |
+| Hybrid (encode512 separate, rest branched) | 28.5 (-19%) | 20.8 (-15%) | encode512 must be separate |
+| By-value struct (monolithic) | 15.9 (-55%) | — | Struct copy + large body |
+
+**Root cause: NOT struct copy.** Even with individual `v := global` hoisting (no struct at all),
+the fully monolithic function regresses 31-46%. The compiler generates worse code for larger
+function bodies — more register spilling, worse scheduling. This is a fundamental Go compiler
+limitation, distinct from LICM.
+
+**Key findings:**
+1. encode512 (512-bit) MUST be a separate function — combining 512-bit and 256-bit tiers in
+   one body causes massive register pressure
+2. Branched hoisting (constants inside if/else) recovers significant performance vs shared
+   hoisting at function entry — the compiler treats each branch as a smaller scope
+3. Even with branched hoisting, monolithic functions still regress 15-19% vs separate functions
+4. The regression scales with function body size: more SIMD operations in one body = worse code
+
+**Verdict:** Separate per-tier functions are the only way to get full performance. The hybrid
+approach is a middle ground but still loses 15-19% at large sizes.
+
 ## Summary of Hoisting Approaches Tested
 
 | Approach | Intrinsics inlined? | Constants hoisted? | Performance | Verdict |
