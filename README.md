@@ -1,10 +1,6 @@
 # simdenc [![Go Reference](https://pkg.go.dev/badge/github.com/dans-stuff/simdenc.svg)](https://pkg.go.dev/github.com/dans-stuff/simdenc) [![Go Report Card](https://goreportcard.com/badge/github.com/dans-stuff/simdenc)](https://goreportcard.com/report/github.com/dans-stuff/simdenc)
 
-SIMD-accelerated encoding for Go. Currently supports **base64**.
-
-- **Up to 25x faster** base64 encoding than stdlib, **35 GB/s** on AMD EPYC Zen 4
-- **Pure Go** via `simd/archsimd` — no assembly files, no CGo, drop-in `encoding/base64` API
-- **All encodings**: `StdEncoding`, `RawStdEncoding`, `URLEncoding`, `RawURLEncoding` — all SIMD-accelerated
+An experiment in SIMD-accelerated base64 encoding using Go 1.26's new `simd/archsimd` intrinsics. Pure Go, no assembly files, no CGo.
 
 ```go
 import "github.com/dans-stuff/simdenc"
@@ -13,65 +9,86 @@ encoded := simdenc.StdEncoding.EncodeToString(data)
 decoded, err := simdenc.StdEncoding.DecodeString(encoded)
 ```
 
+Drop-in replacement for `encoding/base64`. Falls back to stdlib on platforms without SIMD support.
+
 ## Performance
 
-Measured on AMD EPYC 9R14 (Zen 4), single core. Compared against every fast Go base64 library and two C/C++ libraries.
+63 GB/s encode, 31 GB/s decode. Measured on AMD EPYC 9B45 (Zen 5), single core.
 
 **Encode (GB/s):**
 
-| Size | simdenc | emmansun | cristalhq | stdlib | aklomp (C) | simdutf (C++) |
-|------|---------|----------|-----------|--------|------------|---------------|
-| 100 B | 2.6 | 6.1 | 2.3 | 1.3 | 1.9 | 3.5 |
-| 1 KB | 11.2 | 17.8 | 1.3 | 1.4 | 17.0 | 20.3 |
-| 10 KB | 17.8 | 23.6 | 1.3 | 1.4 | 46.6 | 26.9 |
-| 64 KB | 17.9 | 22.0 | 1.3 | 1.2 | 39.1 | 20.6 |
+| Size | simdenc | emmansun | cristalhq | stdlib |
+|------|---------|----------|-----------|--------|
+| 64 B | 6.4 | 7.4 | 3.7 | 1.9 |
+| 256 B | 21.5 | 18.4 | 4.0 | 1.8 |
+| 1 KB | 45.4 | 26.5 | 4.0 | 1.9 |
+| 10 KB | 61.0 | 27.9 | 4.1 | 1.9 |
+| 64 KB | 63.6 | 28.7 | 4.1 | 1.9 |
+| 1 MB | 48.1 | 28.5 | 4.1 | 1.9 |
 
 **Decode (GB/s):**
 
-| Size | simdenc | emmansun | cristalhq | stdlib | aklomp (C) | simdutf (C++) |
-|------|---------|----------|-----------|--------|------------|---------------|
-| 100 B | 2.5 | 3.5 | 1.4 | 1.4 | 3.7 | 1.8 |
-| 1 KB | 10.0 | 16.3 | 1.7 | 1.5 | 16.6 | 12.9 |
-| 10 KB | 12.6 | 24.4 | 1.6 | 1.5 | 22.9 | 21.5 |
-| 64 KB | 11.4 | 24.1 | 1.7 | 1.6 | 22.0 | 21.4 |
+| Size | simdenc | emmansun | cristalhq | stdlib |
+|------|---------|----------|-----------|--------|
+| 64 B | 5.7 | 4.3 | 3.7 | 2.4 |
+| 256 B | 15.7 | 13.3 | 4.0 | 2.8 |
+| 1 KB | 25.7 | 24.1 | 4.0 | 2.8 |
+| 10 KB | 30.5 | 30.7 | 4.0 | 2.9 |
+| 64 KB | 31.2 | 32.4 | 4.0 | 2.9 |
+| 1 MB | 30.9 | 32.0 | 4.0 | 2.9 |
 
-At 1 KB+, simdenc is significantly faster than stdlib and cristalhq for both encode and decode. The one library that beats us at large encode is [aklomp/base64](https://github.com/aklomp/base64) (C), which uses VPMULTISHIFTQB — an AVX-512 instruction not yet exposed by Go's `archsimd` package.
+The other libraries are there to contextualize where compiler-generated SIMD sits. emmansun uses hand-written AVX2 assembly. cristalhq uses Go with some SIMD tricks. The encode result is the interesting part: 33x stdlib from pure Go compiler intrinsics, about 2x the hand-written assembly at 64 KB. Decode converges with emmansun around 31 GB/s; they're ~4% faster at large sizes due to bounds checks and instruction scheduling that the Go compiler can't quite match.
 
-See [RESEARCH.md](RESEARCH.md) for the full experiment log.
+See [RESEARCH.md](RESEARCH.md) for the full experiment log with 37 A/B tests.
 
 ## How it works
 
 CPU features are detected at init. The best available path is selected automatically:
 
 - **No SIMD**: delegates to `encoding/base64` (ARM, older x86, etc.)
-- **AVX2**: 256-bit encode/decode covering any x86 CPU from ~2013 onward, including under Rosetta 2
-- **AVX-512 + VBMI**: 512-bit encode with adaptive 256-bit tail, VPERMB-accelerated decode. Targets AMD EPYC Zen 4+, Intel Ice Lake+
+- **SSE (128-bit)**: encode and decode for small inputs (< ~120 bytes)
+- **AVX2 (256-bit)**: fused with SSE bookends for medium inputs. SSE handles the first and last 12/16 bytes, AVX2 fills the middle.
+- **AVX-512 + VBMI**: standalone 512-bit encode loop with SSE cleanup, VPERMB-accelerated 256-bit decode
 
-On the fastest hardware, a single encode call chains two dedicated functions: 512-bit bulk (48 bytes/iteration), then 256-bit cleanup (24 bytes/iteration), then scalar for the last few bytes. Each function hoists only its own constants into local variables, keeping register pressure low.
+Each tier is its own function that hoists only its own constants. A tiny dispatch function selects the tier based on input size and CPU features. This matters because the Go compiler allocates registers per-function, so merging tiers into one function causes spills and 50%+ regressions.
 
-## Things I learned
+## What I learned
 
-I built this to see what Go 1.26's new SIMD intrinsics can actually do. Base64 is a well-studied problem with decades of SIMD research, so it's a good test. Every optimization was A/B tested on EPYC. Here's what stood out:
+I built this to see what Go 1.26's SIMD intrinsics can actually do. Base64 is a well-studied problem with decades of SIMD research, so it's a good test case. Every optimization was A/B tested on EPYC Zen 4 and Zen 5.
 
-**One instruction changed everything.** There's an AVX-512 instruction called VPERMB that can rearrange any of 64 bytes into any order in a single step. Base64 encoding needs to convert 6-bit values into ASCII characters, which normally takes 4 separate operations. With VPERMB you just build a 64-entry lookup table and do it in one shot. That single change is where most of the AVX-512 speedup comes from.
+### VPERMB is the big win
 
-**Wider isn't always better.** Going from 256-bit to 512-bit vectors made encoding 55% faster, but decoding actually got 12% *slower*. Decoding has a longer chain of steps that depend on each other (validate, translate, pack, compact), and on Zen 4 each 512-bit step takes twice as long as its 256-bit equivalent. More width, same serial bottleneck.
+There's an AVX-512 instruction called VPERMB that rearranges any of 64 bytes into any order in a single step. Base64 encoding converts 6-bit values to ASCII characters, which normally takes 4 operations. VPERMB turns it into a 64-entry lookup table and does it in one shot. That's where most of the AVX-512 encode speedup comes from.
 
-**Mixing vector widths in a single call was a big win.** For encoding, we run the 512-bit path on the bulk of the data, then switch to 256-bit for the leftover 24-47 bytes instead of falling back to slow byte-at-a-time scalar code. The 256-bit stage reuses 4 bytes of overlap from the previous stage's output, eliminating the need for a separate scalar preamble. That gave +27% at 1 KB versus using either width alone.
+### 512-bit is faster for encode, slower for decode
 
-**Go has no Loop Invariant Code Motion (LICM).** Global variables are reloaded from memory on every single loop iteration — even when there are no stores or function calls in the loop body. This isn't about aliasing or goroutines; Go's compiler simply doesn't implement this optimization ([tracked in golang/go#63670](https://github.com/golang/go/issues/63670)). The workaround is copying each global into a local variable before the loop (`v := globalVec`). The compiler treats locals as register-eligible, so they stay in registers across iterations. This gave +37% for encode and +32% for decode.
+Going from 256-bit to 512-bit vectors made encoding 55% faster on Zen 4 and over 2x faster on Zen 5, but decoding got 12% slower. Decode has a longer dependency chain (validate, translate, pack, compact) that doesn't benefit from wider execution. Encode's pipeline is shorter and more parallel.
 
-**Closures kill SIMD intrinsic inlining.** We tried a closure approach where a factory function captures all constants and returns the inner decode/encode function. The captured values were correctly hoisted (loaded once, not reloaded per iteration). But Go's compiler refuses to inline SIMD intrinsics inside closure bodies — `LoadUint8x32Slice` and `StoreSlice` become real `CALL` instructions instead of inline VMOVDQU. This caused a 7-8x slowdown, capping throughput at ~6 GB/s regardless of input size. This happens even when the closure is called directly from a local variable (not through a function pointer), so it's a fundamental compiler limitation, not a devirtualization issue.
+### Fused bookends
 
-**By-value struct arguments work as implicit hoisting — but only for small structs.** Passing a struct of constants by value copies them onto the callee's stack, which acts as a hoist. This is equivalent to individual `v := global` copies but more self-documenting. However, when the struct exceeds ~200 bytes (7+ YMM vectors), the copy overhead and register pressure cause regressions. A monolithic function that combines all tiers (512-bit + 256-bit + scalar) with all constants in scope regressed 52% at 1 KB compared to separate per-tier functions.
+For encode and decode, we process the first and last few bytes with SSE (128-bit), then fill the middle with AVX2 or AVX-512. The SSE preamble and tail overlap slightly with the wider loop's output. The overlap is harmless (same data written twice) and eliminates the need for a separate scalar preamble or tail. This gave +27% at 1 KB for encode versus using either width alone.
 
-**Keeping per-tier functions small was critical.** Each SIMD tier (AVX-512, VBMI 256-bit, AVX2) is its own function that hoists only its own ~6-7 constants. Merging them into a single function hurt performance at all sizes above 100 bytes, because the compiler must manage register allocation for all code paths simultaneously. Separate functions let each hot loop use nearly all available registers for its own constants.
+### Go has no LICM
 
-**`unsafe.Pointer` loads gave exactly 0% improvement.** We tried bypassing the safe `LoadSlice` API with raw pointer arithmetic. No difference at all. The compiler already eliminates bounds checks when you give it explicit slice bounds like `src[i:i+32]`.
+Global variables are reloaded from memory on every loop iteration, even when there are no stores or function calls in the loop body. Go's compiler simply doesn't implement Loop Invariant Code Motion ([golang/go#63670](https://github.com/golang/go/issues/63670)). The workaround is copying each global into a local before the loop (`v := globalVec`). Locals are register-eligible, so they stay in registers across iterations. This gave +37% for encode and +32% for decode.
 
-**Rosetta 2 is weird.** Byte-identical x86 machine code in the same binary can run at completely different speeds under Rosetta, depending on where the function lands in memory. We confirmed this by copying a competitor's assembly function verbatim into our binary: the original ran at 6.3 GB/s, our copy ran at 2.2 GB/s, same instructions. Not actionable, just interesting.
+### Closures kill SIMD inlining
 
-See [RESEARCH.md](RESEARCH.md) for the full experiment log with all the numbers.
+We tried a closure approach where a factory function captures all constants and returns the inner function. The captured values were hoisted correctly (loaded once, not reloaded per iteration). But Go's compiler won't inline SIMD intrinsics inside closure bodies. `LoadUint8x32Slice` and `StoreSlice` become real `CALL` instructions instead of inline VMOVDQU. 7-8x slowdown, capping throughput at ~6 GB/s regardless of input size. This happens even when the closure is called directly from a local variable, so it's a compiler limitation, not a devirtualization issue.
+
+### Small functions or nothing
+
+Each SIMD tier is its own function with ~6-7 hoisted constants. Merging them into one function hurts at all sizes above 100 bytes because the compiler manages register allocation for all code paths simultaneously. Even adding a 3-line size check to a dispatch function can degrade the SIMD callees by 50%. Keep dispatch functions tiny: no constant hoisting, no loops, just a size check and a tail call.
+
+### unsafe.Pointer loads: 0% improvement
+
+We tried bypassing the safe `LoadSlice` API with raw pointer arithmetic. No difference. The compiler already eliminates bounds checks when you give it explicit slice bounds like `src[i:i+32]`.
+
+### Rosetta 2 weirdness
+
+Byte-identical x86 machine code in the same binary can run at completely different speeds under Rosetta 2, depending on where the function lands in memory. We copied a competitor's assembly function verbatim into our binary: the original ran at 6.3 GB/s, our copy ran at 2.2 GB/s, same instructions. Not actionable, just interesting.
+
+See [RESEARCH.md](RESEARCH.md) for the full experiment log.
 
 ## The catch
 

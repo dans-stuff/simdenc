@@ -298,9 +298,8 @@ func encodeSSEAVX2(alphabet uint8, a *encodeAlpha, dst, src []byte) (int, int) {
 	avxLastUpperSextet := encLastUpperSextet
 	avxSextetToAscii := a.sextetToAscii
 
-	// --- SSE bookends: preamble (si=0) then tail (last position) ---
+	// --- SSE preamble: encode src[0:12] → dst[0:16] ---
 
-	// Preamble.
 	grouped := archsimd.LoadUint8x16Slice(src[0:16]).PermuteOrZero(sseShuffle)
 	w := grouped.AsUint16x8()
 	sextets := w.And(sseMaskHi).MulHigh(sseShiftHi).Or(w.And(sseMaskLo).Mul(sseShiftLo)).AsUint8x16()
@@ -310,20 +309,6 @@ func encodeSSEAVX2(alphabet uint8, a *encodeAlpha, dst, src []byte) (int, int) {
 	asciiOffset := sseSextetToAscii.PermuteOrZero(rangeIdx.AsInt8x16())
 	result := sextets.Add(asciiOffset)
 	result.StoreSlice(dst[0:16])
-
-	// Tail: last valid SSE position (overlap with AVX2 is fine).
-	tailSi := n - 16
-	tailSi = tailSi - tailSi%3 // align to triplet boundary
-	tailDi := tailSi / 3 * 4
-	grouped = archsimd.LoadUint8x16Slice(src[tailSi : tailSi+16]).PermuteOrZero(sseShuffle)
-	w = grouped.AsUint16x8()
-	sextets = w.And(sseMaskHi).MulHigh(sseShiftHi).Or(w.And(sseMaskLo).Mul(sseShiftLo)).AsUint8x16()
-	saturated = sextets.SubSaturated(sseLowerSextet)
-	pastUpper = sextets.AsInt8x16().Greater(sseUpperSextet).ToInt8x16().AsUint8x16()
-	rangeIdx = saturated.Sub(pastUpper)
-	asciiOffset = sseSextetToAscii.PermuteOrZero(rangeIdx.AsInt8x16())
-	result = sextets.Add(asciiOffset)
-	result.StoreSlice(dst[tailDi : tailDi+16])
 
 	// --- AVX2 middle: loop from si=12 (after SSE preamble) ---
 	// AVX2 needs si >= 4 for the -4 offset trick; si=12 satisfies this.
@@ -344,8 +329,24 @@ func encodeSSEAVX2(alphabet uint8, a *encodeAlpha, dst, src []byte) (int, int) {
 		di += 32
 	}
 
-	// Return past the SSE tail (which covers everything).
-	return tailDi + 16, tailSi + 12
+	// --- SSE cleanup: encode remaining bytes after AVX2 loop ---
+	srcEnd16, dstEnd16 := n-16, len(dst)-16
+	for si <= srcEnd16 && di <= dstEnd16 {
+		grouped = archsimd.LoadUint8x16Slice(src[si : si+16]).PermuteOrZero(sseShuffle)
+		w = grouped.AsUint16x8()
+		sextets = w.And(sseMaskHi).MulHigh(sseShiftHi).Or(w.And(sseMaskLo).Mul(sseShiftLo)).AsUint8x16()
+		saturated = sextets.SubSaturated(sseLowerSextet)
+		pastUpper = sextets.AsInt8x16().Greater(sseUpperSextet).ToInt8x16().AsUint8x16()
+		rangeIdx = saturated.Sub(pastUpper)
+		asciiOffset = sseSextetToAscii.PermuteOrZero(rangeIdx.AsInt8x16())
+		result = sextets.Add(asciiOffset)
+		d := dst[di:]
+		result.StoreSlice(d[:16])
+		si += 12
+		di += 16
+	}
+
+	return di, si
 }
 
 // encode512 runs the 512-bit encode loop only. Returns (di, si) indicating
@@ -601,7 +602,9 @@ func doDecode(alphabet uint8, dst, src []byte) (int, int) {
 		di, si = decodeSSE(a, dst, src, 0, 0)
 	}
 
-	// Scalar remainder: full quads.
+	// Scalar remainder: full quads only. Partial blocks (2-3 trailing chars)
+	// are left for the stdlib fallback in Decode(), which handles newline
+	// stripping and error reporting correctly.
 	table := &decTables[alphabet]
 	for si+3 < n {
 		va, vb, vc, vd := table[src[si]], table[src[si+1]], table[src[si+2]], table[src[si+3]]
@@ -611,23 +614,6 @@ func doDecode(alphabet uint8, dst, src []byte) (int, int) {
 		dst[di], dst[di+1], dst[di+2] = va<<2|vb>>4, vb<<4|vc>>2, vc<<6|vd
 		si += 4
 		di += 3
-	}
-	// Partial block (2-3 chars without padding).
-	if rem := n - si; rem >= 2 {
-		va, vb := table[src[si]], table[src[si+1]]
-		if (va|vb)&0x80 == 0 {
-			dst[di] = va<<2 | vb>>4
-			di++
-			si += 2
-			if rem >= 3 {
-				vc := table[src[si]]
-				if vc&0x80 == 0 {
-					dst[di] = vb<<4 | vc>>2
-					di++
-					si++
-				}
-			}
-		}
 	}
 	return di, si
 }
