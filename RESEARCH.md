@@ -957,3 +957,26 @@ Also works for LoadSlice: `s := src[si:]; archsimd.LoadUint8x32Slice(s[:32])`.
 Both functions independently saturate nearly all available YMM registers. decodeAVX2 uses one more (Y14) because it needs two extract constants (`extractShuffle` + `extractPermute`) vs VBMI's single `extractVBMI`.
 
 **Implication**: The two-level architecture (dispatcher → separate SIMD functions) is optimal precisely because each function gets its own full register budget. If they were merged into one function body, even with branches, the compiler would likely allocate globally across both paths, reducing the effective budget for each. This confirms the findings from experiment 23 (monolithic function body size) and experiment 26 (branch cost).
+
+## Experiment 30: Flush-Start AVX2 Encode (VPERMD + VPSHUFB) — MIXED
+
+**Problem**: AVX2 encode uses a -4 offset load trick because VPSHUFB can only shuffle within 128-bit lanes. The group [bytes 15,16,17] spans the lane boundary. The -4 offset shifts everything so no group crosses the boundary, but requires a 6-byte scalar preamble on the first call.
+
+**Approach**: Use VPERMD to rearrange dwords across lanes first, placing bytes 0-11 in lane 0 and bytes 12-23 in lane 1, then VPSHUFB for intra-lane byte grouping. This loads from src[si:si+32] with no offset trick, eliminating the preamble.
+
+**Tradeoff**: One extra instruction per iteration (VPERMD), and srcEnd = len(src)-32 vs len(src)-28, meaning fewer SIMD iterations at the tail.
+
+**Results** (GB/s):
+
+| Size | Flush-start | Offset (-4) | Delta |
+|---|---|---|---|
+| 48 | 1.58 | 1.48 | +7% (no preamble) |
+| 64 | 2.49 | 2.38 | +5% |
+| 100 | 2.40 | 5.39 | -55% (lost 1 SIMD iteration) |
+| 128 | 5.59 | 5.83 | -4% |
+| 1000 | 17.6 | 19.9 | -12% |
+| 65536 | 33.5 | 33.9 | -1% |
+
+**Analysis**: The flush path wins at tiny sizes (48-64 bytes) where eliminating the preamble matters, but loses at medium-to-large sizes due to: (a) extra VPERMD instruction costing ~1-3% throughput, and (b) wider read window (32 vs 28 bytes) losing entire SIMD iterations at the tail. At n=100, this loses a full iteration — the offset path gets 2 AVX2 iterations vs flush getting only 1.
+
+**Conclusion**: The -4 offset trick is worth keeping. The 6-byte scalar preamble (~10ns) is far cheaper than losing SIMD iterations. The offset trick's tighter read window (28 vs 32 bytes) extracts more SIMD iterations from the same data. Reverted.
