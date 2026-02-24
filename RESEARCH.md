@@ -878,6 +878,38 @@ dispatch to a separate function before entering the loop (not inside it).
 branch, use two function bodies (VBMI and AVX2) selected by the dispatcher. This
 matches the performance of separate functions while keeping the dispatch logic clean.
 
+## Experiment 27: Why the Reslice Trick Works — Bounds Check Elimination
+
+**Pattern:** `d := dst[di:]` followed by `result.StoreSlice(d[:32])` instead of
+`result.StoreSlice(dst[di : di+32])`.
+
+**Assembly diff (decodeVBMI):**
+
+Without reslice (239 bytes):
+```asm
+LEA  32(R8), R9      ; compute di+32
+...
+CMP  R8, R9           ; check di < di+32 (bounds check for StoreSlice)
+```
+
+With reslice (230 bytes):
+```asm
+CMP  CX, R8           ; check di < len(dst) (simpler, uses pre-computed value)
+```
+
+**Root cause:** Without the reslice, `StoreSlice(dst[di : di+32])` requires the compiler
+to verify `di+32 <= cap(dst)`. This needs a LEA to compute `di+32` and an extra CMP.
+With the reslice, the compiler knows `d` starts at `dst[di:]` with capacity `cap(dst)-di`,
+so `StoreSlice(d[:32])` just needs to check `32 <= cap(d)`, which is equivalent to
+`di+32 <= cap(dst)` — but the compiler proves this from the loop condition
+`di <= len(dst)-32`, eliminating both instructions.
+
+**Impact:** 2 fewer instructions per loop iteration. Function size: 230 vs 239 bytes (-4%).
+Performance: +3% at 64KB (24.3 vs 23.6 GB/s).
+
+**Verdict: KEEP.** Apply `d := dst[di:]` before every StoreSlice in hot loops.
+Also works for LoadSlice: `s := src[si:]; archsimd.LoadUint8x32Slice(s[:32])`.
+
 ## Summary of Hoisting Approaches Tested
 
 | Approach | Intrinsics inlined? | Constants hoisted? | Performance | Verdict |
