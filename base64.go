@@ -13,7 +13,26 @@ const (
 
 	alphabetStd uint8 = 0
 	alphabetURL uint8 = 1
+
+	encodeStdAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	encodeURLAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+
+var encAlphabets = [2]string{encodeStdAlpha, encodeURLAlpha}
+
+// Decode lookup tables: ASCII byte → 6-bit value, 0xFF for invalid.
+var decTables [2][256]byte
+
+func init() {
+	for a := range 2 {
+		for i := range decTables[a] {
+			decTables[a][i] = 0xFF
+		}
+		for i, c := range encAlphabets[a] {
+			decTables[a][c] = byte(i)
+		}
+	}
+}
 
 // Encoding defines a base64 encoding/decoding scheme.
 type Encoding struct {
@@ -33,8 +52,8 @@ var (
 // rawStdlib provides no-padding stdlib encodings for decoding error paths.
 var rawStdlib = [2]*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding}
 
-// Set by platform-specific init when SIMD is available. One level of
-// indirection: set once at startup, called directly thereafter.
+// SIMD dispatch: set by platform-specific init when SIMD is available.
+// When nil, Encode/Decode delegate entirely to encoding/base64.
 var (
 	simdEncode func(alphabet uint8, dst, src []byte)
 	simdDecode func(alphabet uint8, dst, src []byte) (int, int)
@@ -63,7 +82,7 @@ func (enc *Encoding) DecodedLen(n int) int {
 }
 
 func (enc *Encoding) Encode(dst, src []byte) {
-	if simdEncode == nil || len(src) < 34 {
+	if simdEncode == nil {
 		enc.base.Encode(dst, src)
 		return
 	}

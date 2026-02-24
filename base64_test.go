@@ -189,7 +189,7 @@ func randfuzz(n int) []byte {
 func BenchmarkEncode(b *testing.B) {
 	em := emmansun.StdEncoding.WithPadding(emmansun.NoPadding)
 	cr := cristalhq.RawStdEncoding
-	for _, size := range []int{3, 12, 24, 48, 64, 100, 128, 256, 1000, 10000, 65536} {
+	for _, size := range []int{3, 12, 24, 48, 64, 100, 128, 256, 1000, 10000, 65536, 131072, 1000000, 2000000, 4000000, 8000000, 16000000} {
 		raw := make([]byte, size)
 		rand.Read(raw)
 		n := RawStdEncoding.EncodedLen(size)
@@ -228,7 +228,7 @@ func BenchmarkEncode(b *testing.B) {
 func BenchmarkDecode(b *testing.B) {
 	em := emmansun.StdEncoding.WithPadding(emmansun.NoPadding)
 	cr := cristalhq.RawStdEncoding
-	for _, size := range []int{64, 100, 128, 256, 1000, 10000, 65536} {
+	for _, size := range []int{64, 100, 128, 256, 1000, 10000, 65536, 131072, 1000000, 2000000, 4000000, 8000000, 16000000} {
 		raw := make([]byte, size)
 		rand.Read(raw)
 		enc := []byte(base64.RawStdEncoding.EncodeToString(raw))
