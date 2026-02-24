@@ -980,3 +980,40 @@ Both functions independently saturate nearly all available YMM registers. decode
 **Analysis**: The flush path wins at tiny sizes (48-64 bytes) where eliminating the preamble matters, but loses at medium-to-large sizes due to: (a) extra VPERMD instruction costing ~1-3% throughput, and (b) wider read window (32 vs 28 bytes) losing entire SIMD iterations at the tail. At n=100, this loses a full iteration — the offset path gets 2 AVX2 iterations vs flush getting only 1.
 
 **Conclusion**: The -4 offset trick is worth keeping. The 6-byte scalar preamble (~10ns) is far cheaper than losing SIMD iterations. The offset trick's tighter read window (28 vs 32 bytes) extracts more SIMD iterations from the same data. Reverted.
+
+## Experiment 31: Overlapping AVX2 Tail Iteration — WIN (+7-23%)
+
+**Insight**: The AVX2 encode loop advances by 24-byte stride. When the stride doesn't align with the end of the data, up to 23 bytes are left for scalar processing (1-7 full triplets). But there's a valid SIMD position that the stride jumped over. Since base64 is deterministic, re-encoding overlapping bytes produces identical output — the overlap is harmless.
+
+**Implementation**: After the forward AVX2 loop, compute the last valid 3-aligned load position. If it's before the current `si` but covers new bytes (`last+24 > si+6`), call encodeAVX2 again at that position. This is just a second call to the same function — no code duplication, no changes to encodeAVX2.
+
+```go
+if last := (n-28) - (n-28)%3; last >= 4 && last < si && last+24 > si+6 {
+    di, si = encodeAVX2(a, dst, src, last/3*4, last)
+}
+```
+
+**Key details**:
+- `last+24 > si`: ensures the overlap covers NEW bytes past current si (not a pure re-encode)
+- `+6` threshold: avoids firing when only 1-2 scalar triplets would be saved (the function call overhead with re-hoisting 8 variables costs more than 1-2 scalar iterations)
+- The function call overhead (~10ns for hoisting + CALL) is amortized by replacing 3-7 scalar iterations (~5ns each)
+
+**Results** (GB/s, median of 5 runs):
+
+| Size | Overlap | Baseline | Delta |
+|---|---|---|---|
+| 64 | 2.86 | 2.38 | +18% |
+| 100 | 5.50 | 5.39 | +2% |
+| 128 | 5.75 | 5.83 | -1% (noise) |
+| 256 | 10.9 | 8.2 | +23% |
+| 1000 | 23.4 | 19.9 | +15% |
+| 10000 | 34.8 | 33.5 | +4% |
+| 65536 | 36.6 | 33.9 | +7% |
+
+**Development journey**: Three implementations were tested:
+1. **Second call from doEncode**: Clean but bloated doEncode by 192 bytes. Showed mixed results with some sizes regressing ~8% — initially suspected function size issue, but actually noise.
+2. **Duplicated body inside encodeAVX2**: Grew encodeAVX2 from 791→1214 bytes (+53%). The larger function degraded register allocation, confirmed by assembly analysis.
+3. **Single-body loop restructure**: Kept one copy of the loop body with a conditional backup. Grew encodeAVX2 by only 135 bytes. Mixed results.
+4. **Final: second call (same as #1) with `+6` threshold**: The simplest approach — just call encodeAVX2 twice. The key realization: encodeAVX2 is NOT inlined into doEncode (verified via assembly: real CALL instructions). The 186-byte doEncode growth is all argument setup and panicBounds entries, not SIMD codegen. The original "regression" at large sizes was server noise.
+
+**Architectural insight**: The overlap technique treats SIMD encode as a composable primitive. The dispatcher can call it with any valid (si, di) parameters, including overlapping regions. The function doesn't need to know whether its output overlaps with a previous call. This enables flexible dispatch strategies without modifying the SIMD inner loop.
