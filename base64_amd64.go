@@ -13,8 +13,6 @@ const (
 type encodeAlpha struct {
 	alphabet      string
 	sextetToAscii archsimd.Uint8x32 // AVX2: range-based sextet→ASCII offset
-	asciiTableLo  archsimd.Uint8x32 // VBMI: 64-entry table, low 32 entries
-	asciiTableHi  archsimd.Uint8x32 // VBMI: 64-entry table, high 32 entries
 	asciiTable512 archsimd.Uint8x64 // AVX-512: 64-entry table in one vector
 }
 
@@ -48,9 +46,6 @@ var (
 	encLastLowerSextet archsimd.Uint8x32 // broadcast 51
 	encLastUpperSextet archsimd.Int8x32  // broadcast 25
 )
-
-// VBMI encode constants.
-var encCrossLaneShuffle archsimd.Uint8x32
 
 // AVX-512 encode constants.
 var (
@@ -107,12 +102,6 @@ func init() {
 	}).AsInt8x32()
 	encLastLowerSextet = archsimd.BroadcastUint8x32(51)
 	encLastUpperSextet = archsimd.BroadcastInt8x32(25)
-
-	// VBMI encode.
-	encCrossLaneShuffle = archsimd.LoadUint8x32(&[32]byte{
-		1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10,
-		13, 12, 14, 13, 16, 15, 17, 16, 19, 18, 20, 19, 22, 21, 23, 22,
-	})
 
 	// Shared decode.
 	nibbleMask = archsimd.BroadcastUint8x32(0x0F)
@@ -179,23 +168,6 @@ func initAlphabet(idx uint8, alphabet string, specialChar, enc62, enc63, special
 	a.sextetToAscii = dupBytes(archsimd.LoadUint8x16(&[16]byte{
 		65, 71, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, enc62, enc63,
 	}))
-	var lo32, hi32 [32]byte
-	for i := range 26 {
-		lo32[i] = 65
-	}
-	for i := 26; i < 32; i++ {
-		lo32[i] = 71
-	}
-	for i := range 20 {
-		hi32[i] = 71
-	}
-	for i := 20; i < 30; i++ {
-		hi32[i] = 252
-	}
-	hi32[30], hi32[31] = enc62, enc63
-	a.asciiTableLo = archsimd.LoadUint8x32(&lo32)
-	a.asciiTableHi = archsimd.LoadUint8x32(&hi32)
-
 	// AVX-512 table.
 	var t512 [64]byte
 	for i := range 26 {
@@ -254,78 +226,58 @@ func encode512(a *encodeAlpha, dst, src []byte) (di, si int) {
 	return di, si
 }
 
+func encodeAVX2(a *encodeAlpha, dst, src []byte, di, si int) (int, int) {
+	encOffsetShuffle := encOffsetShuffle
+	encSextetMaskHi := encSextetMaskHi
+	encSextetShiftHi := encSextetShiftHi
+	encSextetMaskLo := encSextetMaskLo
+	encSextetShiftLo := encSextetShiftLo
+	encLastLowerSextet := encLastLowerSextet
+	encLastUpperSextet := encLastUpperSextet
+	sextetToAscii := a.sextetToAscii
+
+	srcEnd, dstEnd := len(src)-28, len(dst)-32
+	for si <= srcEnd && di <= dstEnd {
+		grouped := archsimd.LoadUint8x32Slice(src[si-4 : si+28]).PermuteOrZeroGrouped(encOffsetShuffle)
+		w := grouped.AsUint16x16()
+		sextets := w.And(encSextetMaskHi).MulHigh(encSextetShiftHi).Or(w.And(encSextetMaskLo).Mul(encSextetShiftLo)).AsUint8x32()
+		saturated := sextets.SubSaturated(encLastLowerSextet)
+		pastUpper := sextets.AsInt8x32().Greater(encLastUpperSextet).ToInt8x32().AsUint8x32()
+		rangeIdx := saturated.Sub(pastUpper)
+		asciiOffset := sextetToAscii.PermuteOrZeroGrouped(rangeIdx.AsInt8x32())
+		result := sextets.Add(asciiOffset)
+		d := dst[di:]
+		result.StoreSlice(d[:32])
+		si += 24
+		di += 32
+	}
+	return di, si
+}
+
 func doEncode(alphabet uint8, dst, src []byte) {
 	a := &encAlphas[alphabet]
+	alpha := a.alphabet
 	n := len(src)
 	di, si := 0, 0
-	alpha := a.alphabet
 
-	// Stage 1: AVX-512 bulk (separate function for register pressure).
-	if hasAVX512 {
+	// SIMD bulk: encode512 (if available) then AVX2 for cleanup.
+	// AVX2 needs a 4-byte readable overlap before src[si]. After encode512,
+	// si >= 48, so src[si-4:] is always valid. Without encode512, a 6-byte
+	// scalar preamble provides the overlap.
+	if hasAVX512 && n >= 64 {
 		di, si = encode512(a, dst, src)
-	}
-
-	// Stage 2: 256-bit cleanup.
-	if hasAVX512 {
-		// VBMI: cross-lane shuffle, no offset trick needed.
-		encCrossLaneShuffle := encCrossLaneShuffle
-		encSextetMaskHi := encSextetMaskHi
-		encSextetShiftHi := encSextetShiftHi
-		encSextetMaskLo := encSextetMaskLo
-		encSextetShiftLo := encSextetShiftLo
-		asciiTableLo := a.asciiTableLo
-		asciiTableHi := a.asciiTableHi
-
-		srcEnd, dstEnd := n-32, len(dst)-32
-		for si <= srcEnd && di <= dstEnd {
-			grouped := archsimd.LoadUint8x32Slice(src[si : si+32]).Permute(encCrossLaneShuffle)
-			w := grouped.AsUint16x16()
-			sextets := w.And(encSextetMaskHi).MulHigh(encSextetShiftHi).Or(w.And(encSextetMaskLo).Mul(encSextetShiftLo)).AsUint8x32()
-			asciiOffset := asciiTableLo.ConcatPermute(asciiTableHi, sextets)
-			result := sextets.Add(asciiOffset)
-			d := dst[di:]
-			result.StoreSlice(d[:32])
-			si += 24
-			di += 32
+	} else if n >= 34 {
+		// Scalar preamble: encode 6 bytes to provide the -4 offset overlap.
+		for i := 0; i < 2; i++ {
+			v := uint(src[3*i])<<16 | uint(src[3*i+1])<<8 | uint(src[3*i+2])
+			dst[4*i], dst[4*i+1], dst[4*i+2], dst[4*i+3] = alpha[v>>18&0x3F], alpha[v>>12&0x3F], alpha[v>>6&0x3F], alpha[v&0x3F]
 		}
-	} else {
-		// AVX2: lane-local shuffle with -4 offset load trick.
-		if n >= 34 {
-			for i := 0; i < 2; i++ {
-				v := uint(src[3*i])<<16 | uint(src[3*i+1])<<8 | uint(src[3*i+2])
-				dst[4*i], dst[4*i+1], dst[4*i+2], dst[4*i+3] = alpha[v>>18&0x3F], alpha[v>>12&0x3F], alpha[v>>6&0x3F], alpha[v&0x3F]
-			}
-			si = 6
-			di = 8
-
-			encOffsetShuffle := encOffsetShuffle
-			encSextetMaskHi := encSextetMaskHi
-			encSextetShiftHi := encSextetShiftHi
-			encSextetMaskLo := encSextetMaskLo
-			encSextetShiftLo := encSextetShiftLo
-			encLastLowerSextet := encLastLowerSextet
-			encLastUpperSextet := encLastUpperSextet
-			sextetToAscii := a.sextetToAscii
-
-			srcEnd, dstEnd := n-32, len(dst)-32
-			for si <= srcEnd && di <= dstEnd {
-				grouped := archsimd.LoadUint8x32Slice(src[si-4 : si+28]).PermuteOrZeroGrouped(encOffsetShuffle)
-				w := grouped.AsUint16x16()
-				sextets := w.And(encSextetMaskHi).MulHigh(encSextetShiftHi).Or(w.And(encSextetMaskLo).Mul(encSextetShiftLo)).AsUint8x32()
-				saturated := sextets.SubSaturated(encLastLowerSextet)
-				pastUpper := sextets.AsInt8x32().Greater(encLastUpperSextet).ToInt8x32().AsUint8x32()
-				rangeIdx := saturated.Sub(pastUpper)
-				asciiOffset := sextetToAscii.PermuteOrZeroGrouped(rangeIdx.AsInt8x32())
-				result := sextets.Add(asciiOffset)
-				d := dst[di:]
-				result.StoreSlice(d[:32])
-				si += 24
-				di += 32
-			}
-		}
+		si = 6
+		di = 8
 	}
-
-	// Stage 3: scalar tail.
+	if si > 0 {
+		di, si = encodeAVX2(a, dst, src, di, si)
+	}
 	for si+2 < n {
 		v := uint(src[si])<<16 | uint(src[si+1])<<8 | uint(src[si+2])
 		dst[di], dst[di+1], dst[di+2], dst[di+3] = alpha[v>>18&0x3F], alpha[v>>12&0x3F], alpha[v>>6&0x3F], alpha[v&0x3F]
@@ -344,10 +296,7 @@ func doEncode(alphabet uint8, dst, src []byte) {
 
 // --- Decode ---
 
-func decode(alphabet uint8, dst, src []byte) (int, int) {
-	a := &decAlphas[alphabet]
-	di, si := 0, 0
-
+func decodeVBMI(a *decodeAlpha, dst, src []byte) (int, int) {
 	nibbleMask := nibbleMask
 	nibbleShift := nibbleShift
 	validHi := a.validHi
@@ -357,58 +306,77 @@ func decode(alphabet uint8, dst, src []byte) (int, int) {
 	shift := a.shift
 	combinePairs := combinePairs
 	combineQuads := combineQuads
+	extractVBMI := extractVBMI
 
-	if hasAVX512 {
-		extractVBMI := extractVBMI
-		srcEnd, dstEnd := len(src)-32, len(dst)-32
-		for si <= srcEnd && di <= dstEnd {
-			encoded := archsimd.LoadUint8x32Slice(src[si : si+32])
-			hiNib := encoded.AsUint32x8().ShiftRight(nibbleShift).AsUint8x32().And(nibbleMask)
-			loNib := encoded.And(nibbleMask)
-			if !validHi.PermuteOrZeroGrouped(hiNib.AsInt8x32()).And(
-				validLo.PermuteOrZeroGrouped(loNib.AsInt8x32())).IsZero() {
-				break
-			}
-			isSpecial := encoded.Equal(special).ToInt8x32().AsUint8x32().And(shift)
-			roll := rollTable.PermuteOrZeroGrouped(hiNib.Add(isSpecial).AsInt8x32())
-			sextets := encoded.Add(roll)
-			twelveBit := sextets.DotProductPairsSaturated(combinePairs)
-			twentyFourBit := twelveBit.DotProductPairs(combineQuads)
-			result := twentyFourBit.AsUint8x32().Permute(extractVBMI)
-			d := dst[di:]
-			result.StoreSlice(d[:32])
-			si += 32
-			di += 24
+	di, si := 0, 0
+	srcEnd, dstEnd := len(src)-32, len(dst)-32
+	for si <= srcEnd && di <= dstEnd {
+		encoded := archsimd.LoadUint8x32Slice(src[si : si+32])
+		hiNib := encoded.AsUint32x8().ShiftRight(nibbleShift).AsUint8x32().And(nibbleMask)
+		loNib := encoded.And(nibbleMask)
+		if !validHi.PermuteOrZeroGrouped(hiNib.AsInt8x32()).And(
+			validLo.PermuteOrZeroGrouped(loNib.AsInt8x32())).IsZero() {
+			break
 		}
-	} else {
-		extractShuffle := extractShuffle
-		extractPermute := extractPermute
-		srcEnd, dstEnd := len(src)-32, len(dst)-32
-		for si <= srcEnd && di <= dstEnd {
-			encoded := archsimd.LoadUint8x32Slice(src[si : si+32])
-			hiNib := encoded.AsUint32x8().ShiftRight(nibbleShift).AsUint8x32().And(nibbleMask)
-			loNib := encoded.And(nibbleMask)
-			if !validHi.PermuteOrZeroGrouped(hiNib.AsInt8x32()).And(
-				validLo.PermuteOrZeroGrouped(loNib.AsInt8x32())).IsZero() {
-				break
-			}
-			isSpecial := encoded.Equal(special).ToInt8x32().AsUint8x32().And(shift)
-			roll := rollTable.PermuteOrZeroGrouped(hiNib.Add(isSpecial).AsInt8x32())
-			sextets := encoded.Add(roll)
-			twelveBit := sextets.DotProductPairsSaturated(combinePairs)
-			twentyFourBit := twelveBit.DotProductPairs(combineQuads)
-			result := twentyFourBit.AsUint8x32().PermuteOrZeroGrouped(extractShuffle).AsUint32x8().Permute(extractPermute).AsUint8x32()
-			d := dst[di:]
-			result.StoreSlice(d[:32])
-			si += 32
-			di += 24
+		isSpecial := encoded.Equal(special).ToInt8x32().AsUint8x32().And(shift)
+		roll := rollTable.PermuteOrZeroGrouped(hiNib.Add(isSpecial).AsInt8x32())
+		sextets := encoded.Add(roll)
+		twelveBit := sextets.DotProductPairsSaturated(combinePairs)
+		twentyFourBit := twelveBit.DotProductPairs(combineQuads)
+		result := twentyFourBit.AsUint8x32().Permute(extractVBMI)
+		d := dst[di:]
+		result.StoreSlice(d[:32])
+		si += 32
+		di += 24
+	}
+	return di, si
+}
+
+func decodeAVX2(a *decodeAlpha, dst, src []byte) (int, int) {
+	nibbleMask := nibbleMask
+	nibbleShift := nibbleShift
+	validHi := a.validHi
+	validLo := a.validLo
+	rollTable := a.rollTable
+	special := a.special
+	shift := a.shift
+	combinePairs := combinePairs
+	combineQuads := combineQuads
+	extractShuffle := extractShuffle
+	extractPermute := extractPermute
+
+	di, si := 0, 0
+	srcEnd, dstEnd := len(src)-32, len(dst)-32
+	for si <= srcEnd && di <= dstEnd {
+		encoded := archsimd.LoadUint8x32Slice(src[si : si+32])
+		hiNib := encoded.AsUint32x8().ShiftRight(nibbleShift).AsUint8x32().And(nibbleMask)
+		loNib := encoded.And(nibbleMask)
+		if !validHi.PermuteOrZeroGrouped(hiNib.AsInt8x32()).And(
+			validLo.PermuteOrZeroGrouped(loNib.AsInt8x32())).IsZero() {
+			break
 		}
+		isSpecial := encoded.Equal(special).ToInt8x32().AsUint8x32().And(shift)
+		roll := rollTable.PermuteOrZeroGrouped(hiNib.Add(isSpecial).AsInt8x32())
+		sextets := encoded.Add(roll)
+		twelveBit := sextets.DotProductPairsSaturated(combinePairs)
+		twentyFourBit := twelveBit.DotProductPairs(combineQuads)
+		result := twentyFourBit.AsUint8x32().PermuteOrZeroGrouped(extractShuffle).AsUint32x8().Permute(extractPermute).AsUint8x32()
+		d := dst[di:]
+		result.StoreSlice(d[:32])
+		si += 32
+		di += 24
 	}
 	return di, si
 }
 
 func doDecode(alphabet uint8, dst, src []byte) (int, int) {
-	di, si := decode(alphabet, dst, src)
+	a := &decAlphas[alphabet]
+	var di, si int
+	if hasAVX512 {
+		di, si = decodeVBMI(a, dst, src)
+	} else {
+		di, si = decodeAVX2(a, dst, src)
+	}
 
 	// Scalar tail.
 	table := decAlphas[alphabet].decTable
