@@ -391,63 +391,66 @@ So validation costs ~20% of decode throughput. However:
 - **The 4-instruction validation (2 VPSHUFB + VPAND + VPTEST) is already minimal**
   for the Muła/Nojiri scheme. The nibble lookups cannot be reduced further.
 
-## Optimal Configuration
+## Optimal Configuration (Final)
 
-**Encode: 3-stage pipeline** (encode512 + AVX2NoPreamble + encodeScalarTail)
-- encode512: 48 bytes/iter, VPERMB 64-entry LUT, 512-bit width for bulk throughput
-- AVX2NoPreamble: 24 bytes/iter, offset sharing eliminates preamble overhead
-- encodeScalarTail: inline scalar for <34 bytes (fast exit) and remaining tail bytes
-- Peak: 34 GB/s at 10K+, 20 GB/s at 1K
+**Encode: 4-tier dispatch** (SSE → fused SSE+AVX2 → encode512+SSE → scalar)
+- encodeSSE: 12 bytes/iter, 128-bit, for inputs < 120 bytes
+- encodeSSEAVX2: SSE bookends + AVX2 middle, for 120-255 bytes (or 120+ without AVX-512)
+- encode512 + encodeSSE cleanup: 48 bytes/iter 512-bit bulk + SSE remainder, for 256+ bytes
+- Inline scalar tail for < 28 bytes and final partial triplets
+- Peak Zen 4: 36.7 GB/s. Peak Zen 5: 63.6 GB/s
 
-**Decode: VBMI (256-bit)** (decodeVBMI + scalar tail)
-- AVX2 width avoids Zen 4 double-pumping penalty on serial dependency chain
-- VPERMB cross-lane compaction saves 1 instruction vs pure AVX2 (1 op vs 2)
-- Peak: 17 GB/s at 1K, 25 GB/s at 10K+
+**Decode: 3-tier dispatch** (SSE → fused SSE+AVX2 / VBMI → scalar)
+- decodeSSE: 16 bytes/iter, 128-bit, for inputs 16-44 bytes
+- decodeVBMI: 32 bytes/iter, VPERMB 256-bit, for 45+ bytes (AVX-512 machines)
+- decodeSSEAVX2: SSE bookends + AVX2 middle, for 45+ bytes (no AVX-512)
+- Inline scalar tail for < 16 bytes and final partial quads
+- Peak Zen 4: 24.4 GB/s. Peak Zen 5: 31.2 GB/s
 
 ## Full Benchmark Summary (AMD EPYC Zen 4, GB/s)
 
-### Encode (current: encode512 + AVX2NoPreamble + encodeScalarTail)
+### Encode (current: SSE + fused SSE+AVX2 + encode512+SSE + scalar)
 | Size | simdenc | emmansun | stdlib | vs emmansun |
 |------|---------|----------|--------|-------------|
-| 3 | 0.52 | 0.56 | 0.55 | (stdlib fast-exit) |
-| 12 | 0.98 | 1.00 | 1.01 | (stdlib fast-exit) |
-| 24 | 1.17 | 1.24 | 1.22 | (stdlib fast-exit) |
-| 48 | 1.71 | 2.45 | 1.33 | 0.70x |
-| 64 | 2.75 | 4.26 | 1.33 | 0.65x |
-| 100 | 5.0 | 6.0 | 1.3 | 0.83x |
-| 1K | **20.0** | 18.7 | 1.4 | **1.07x** |
-| 10K | **34.0** | 23.4 | 1.4 | **1.45x** |
-| 64K | **33.2** | 22.7 | 1.3 | **1.46x** |
+| 64 | 4.2 | 4.3 | 1.3 | 0.98x |
+| 256 | **14.5** | 10.7 | 1.4 | **1.36x** |
+| 1K | **28.0** | 19.1 | 1.4 | **1.47x** |
+| 10K | **36.0** | 23.3 | 1.4 | **1.55x** |
+| 64K | **36.7** | 23.4 | 1.4 | **1.57x** |
+| 1M | **34.9** | 23.9 | 1.5 | **1.46x** |
 
-Note: emmansun's advantage at 48-100 bytes is due to hand-tuned asm with near-zero
-dispatch overhead. Our Go code has method dispatch + function variable call + multi-stage
-branching that dominates at small sizes. At ≥128 bytes we're competitive, at ≥500 we win.
-
-### Decode (current: decodeVBMI + scalar tail)
+### Decode (current: SSE + VBMI/fused SSE+AVX2 + scalar)
 | Size | simdenc | emmansun | stdlib | vs emmansun |
 |------|---------|----------|--------|-------------|
-| 100 | 4.0 | 4.2 | 1.4 | ~0.97x |
-| 1K | **17.3** | 17.1 | 1.6 | ~1.0x |
-| 10K | **24.7** | 25.1 | 1.5 | 0.98x |
-| 64K | **24.8** | 24.3 | 1.6 | **1.02x** |
+| 64 | **2.0** | 1.3 | 0.7 | **1.54x** |
+| 256 | **5.7** | 4.3 | 0.8 | **1.33x** |
+| 1K | **10.0** | 8.4 | 1.6 | **1.19x** |
+| 10K | 24.1 | 24.8 | 1.5 | 0.97x |
+| 64K | 24.4 | 25.0 | 1.5 | 0.98x |
+| 1M | **24.1** | 23.9 | 1.5 | **1.01x** |
 
 ### vs emmansun (hand-tuned AVX2 asm competitor)
-- Encode 64K: **33.2 GB/s vs 22.7 GB/s** (1.46x faster)
-- Encode 10K: **34.0 GB/s vs 23.4 GB/s** (1.45x faster)
-- Decode 1K: **17.3 GB/s vs 17.1 GB/s** (~parity)
-- Decode 64K: **24.8 GB/s vs 24.3 GB/s** (1.02x)
-- All using pure Go + archsimd intrinsics (no hand-written asm)
-- emmansun wins at ≤100 bytes encode due to hand-tuned asm dispatch overhead
+**Zen 4:**
+- Encode 64K: **36.7 GB/s vs 23.4 GB/s** (1.57x faster)
+- Decode 64K: 24.4 GB/s vs 25.0 GB/s (0.98x, within noise)
+
+**Zen 5:**
+- Encode 64K: **63.6 GB/s vs 28.7 GB/s** (2.22x faster)
+- Decode 64K: 31.2 GB/s vs 32.4 GB/s (0.96x, hand-written asm advantage)
+
+All using pure Go + archsimd intrinsics (no hand-written assembly).
 
 ## Required CPU Features per Path
 
-| Path | Required Features | Width |
-|------|-------------------|-------|
-| encode512 | AVX-512BW + VBMI | 512-bit |
-| encodeAVX2NoPreamble | AVX2 | 256-bit |
-| decodeVBMI | AVX2 + VBMI (+ VL) | 256-bit |
-| decodeAVX2 | AVX2 | 256-bit |
-| stdlib fallback | None | scalar |
+| Path | Required Features | Width | Role |
+|------|-------------------|-------|------|
+| encodeSSE | SSSE3 (via AVX2 gate) | 128-bit | Small encode (< 120 B), cleanup after encode512 |
+| encodeSSEAVX2 | AVX2 | 128+256-bit | Medium encode (120-255 B), fused bookend |
+| encode512 | AVX-512BW + VBMI | 512-bit | Large encode (256+ B) |
+| decodeSSE | SSE4.1 | 128-bit | Small decode (16-44 B) |
+| decodeSSEAVX2 | AVX2 | 128+256-bit | Medium/large decode (no AVX-512), fused bookend |
+| decodeVBMI | AVX2 + VBMI (VL) | 256-bit | Large decode (45+ B, AVX-512 machines) |
+| stdlib fallback | None | scalar | Non-amd64 or no AVX2 |
 
 ## Micro-optimization A/B Tests (AMD EPYC Zen 4)
 
@@ -598,19 +601,20 @@ instruction. If it did, we could likely match aklomp's encode throughput.
 ```
 // Package-level function vars: simdEncode, simdDecode (nil by default → stdlib fallback)
 if AVX2:
-    simdEncode = doEncode          // → encode(encShared, encAlphas[alphabet], dst, src)
-    simdDecode = doDecode          // → decode(decShared, decAlphas[alphabet], dst, src, hasAVX512)
-    populate encShared, decShared  // shared SIMD constants
-    populate encAlphas, decAlphas  // per-alphabet constants (std + URL)
+    simdEncode = doEncode          // 4-tier: SSE → SSE+AVX2 → 512+SSE → scalar
+    simdDecode = doDecode          // 3-tier: SSE → VBMI/SSE+AVX2 → scalar
+    populate encAlphas, decAlphas  // per-alphabet SIMD constants (std + URL)
+    populate shared constants      // nibbleMask, combinePairs, etc.
     if AVX512 + VBMI:
-        hasAVX512 = true           // enables encode512 stage + VPERMB decode compaction
-        populate 512-bit fields in encShared
-        populate VBMI field in decShared
+        hasAVX512 = true           // enables encode512 + VPERMB decode
+        populate 512-bit encode constants
 ```
 
-No stub file needed. When `simdEncode`/`simdDecode` are nil (non-amd64 platforms or
-no AVX2), `base64.go` delegates directly to `encoding/base64`. The amd64 file is the
-only build-tagged file.
+`doEncode` dispatches: n<28 → scalar only, n<120 → encodeSSE, n<256 or no AVX-512 → encodeSSEAVX2, else → encode512 + encodeSSE cleanup. All paths include inline scalar tail.
+
+`doDecode` dispatches: n<16 → scalar only, n<45 → decodeSSE, n≥45+AVX-512 → decodeVBMI, else → decodeSSEAVX2. All paths include inline scalar tail.
+
+No stub file needed. When `simdEncode`/`simdDecode` are nil (non-amd64 or no AVX2), `base64.go` delegates directly to `encoding/base64`.
 
 ## Experiment 18: Go Lacks LICM — Root Cause of Global Reloading
 
@@ -1017,3 +1021,160 @@ if last := (n-28) - (n-28)%3; last >= 4 && last < si && last+24 > si+6 {
 4. **Final: second call (same as #1) with `+6` threshold**: The simplest approach — just call encodeAVX2 twice. The key realization: encodeAVX2 is NOT inlined into doEncode (verified via assembly: real CALL instructions). The 186-byte doEncode growth is all argument setup and panicBounds entries, not SIMD codegen. The original "regression" at large sizes was server noise.
 
 **Architectural insight**: The overlap technique treats SIMD encode as a composable primitive. The dispatcher can call it with any valid (si, di) parameters, including overlapping regions. The function doesn't need to know whether its output overlaps with a previous call. This enables flexible dispatch strategies without modifying the SIMD inner loop.
+
+## Experiment 32: SSE 128-bit Encode and Decode — WIN at small sizes
+
+**Motivation:** Below ~120 bytes, the AVX2 loop gets very few iterations, and the function call + constant hoisting overhead dominates. A 128-bit SSE path processes 12→16 bytes (encode) or 16→12 bytes (decode) per iteration with fewer hoisted constants.
+
+**Implementation:**
+
+`encodeSSE(alphabet, dst, src, di, si)` — processes 12 input → 16 output per iteration. Uses the same sextet extraction (mulhi/mullo) and ASCII mapping (range-based SubSaturated+Greater+PermuteOrZero) as the AVX2 path, but at 128-bit width. Hoists ~8 SSE constants.
+
+`decodeSSE(a, dst, src, di, si)` — processes 16 input → 12 output per iteration. Same nibble-LUT validation + VPMADDUBSW + VPMADDWD pipeline as VBMI decode, but at 128-bit width with VPSHUFB for the final byte extraction. Hoists ~8 SSE constants.
+
+Both functions accept `(di, si)` parameters so they can be called as cleanup after wider loops.
+
+**Results (AMD EPYC Zen 4, GB/s):**
+
+| Size | encodeSSE | scalar | Delta |
+|------|-----------|--------|-------|
+| 36 | 2.5 | 1.3 | +92% |
+| 60 | 5.1 | 1.3 | +292% |
+| 96 | 9.2 | 1.4 | +557% |
+
+| Size | decodeSSE | scalar | Delta |
+|------|-----------|--------|-------|
+| 36 | 2.8 | 1.5 | +87% |
+| 60 | 5.0 | 1.5 | +233% |
+| 96 | 7.8 | 1.6 | +388% |
+
+**Verdict: WIN.** SSE is the optimal path for inputs below ~120 bytes where AVX2 doesn't get enough iterations to amortize its setup cost.
+
+## Experiment 33: Fused SSE+AVX2 Bookend Pattern — WIN (+27% encode, +15% decode)
+
+**Insight:** Applying the same bookend technique from encode (experiment 11) to both encode and decode at the SSE+AVX2 level. SSE processes the first and last few bytes, AVX2 fills the middle. The SSE preamble and tail overlap slightly with the AVX2 region — the overlap is harmless (deterministic, same data written twice).
+
+**Implementation:**
+
+`encodeSSEAVX2(alphabet, a, dst, src)` — SSE preamble (12→16 bytes), SSE tail (last valid 12→16 position), AVX2 loop from si=12 fills the middle. Returns the tail position so the caller knows how far SIMD reached.
+
+`decodeSSEAVX2(a, dst, src)` — SSE preamble (16→12 bytes), SSE tail (last valid 16→12 position), AVX2 loop from si=16 fills the middle.
+
+**Results (AMD EPYC Zen 4, GB/s):**
+
+| Size | fused(sse+avx2) | avx2-only | SSE-only | Best standalone |
+|------|-----------------|-----------|----------|----------------|
+| 150 | 13.4 | 10.5 | 9.5 | fused (+27%) |
+| 256 | 14.5 | 12.0 | 7.8 | fused (+21%) |
+| 512 | 23.1 | 20.1 | 7.1 | fused (+15%) |
+
+**Verdict: WIN.** The fused pattern gives the best throughput for 120-256 bytes, the awkward middle ground where SSE alone doesn't have enough width and AVX2 alone wastes iterations on preamble/tail.
+
+## Experiment 34: Register Pressure from Constant Co-hoisting — KEY FINDING
+
+**Problem:** Initially, the 512-bit encode path was a single fused function `encodeSSE512` that contained both the 512-bit bulk loop AND the SSE cleanup loop. This hoisted ~12 SIMD constants (6 for 512-bit, 6 for SSE) at function entry.
+
+**Discovery:** A/B benchmarking showed a consistent 10-11% encode regression at large sizes (400KB+) compared to the old code that used a standalone `encode512`. The fused function's 12 hoisted constants exceeded the comfortable register budget, causing spills in the hot 512-bit loop body.
+
+**Fix:** Split back to standalone `encode512` (6 constants) called by `doEncode`, followed by `encodeSSE` for cleanup. Each function independently hoists only its own constants.
+
+**Results (AMD EPYC Zen 4, GB/s, encode):**
+
+| Size | fused (12 constants) | split (6+6) | Delta |
+|------|---------------------|-------------|-------|
+| 500 | 22.1 | 25.2 | +14% |
+| 2K | 30.5 | 31.4 | +3% |
+| 400K | 32.8 | 36.4 | +11% |
+
+**Assembly evidence:** `encode512` standalone: 230 bytes, `locals=0x8` (no YMM spills, 6 YMM constants + 2 temporaries). `encodeSSE512` fused: 425 bytes, 12 hoisted YMM vectors saturating all 16 registers, forcing spills in the 512-bit loop body.
+
+**Verdict:** Confirms experiment 23 (monolithic function body size). The register pressure cliff is real: 6-7 SIMD constants per function is the sweet spot on amd64 (16 YMM registers - ~2 for temporaries - ~2 for bookkeeping = 10-12 usable). Beyond that, the compiler spills.
+
+## Experiment 35: Inline Scalar Tails in doEncode/doDecode — WIN (+74% small encode)
+
+**Problem:** The original architecture had SIMD in `base64_amd64.go` and scalar remainder in `base64.go`. The `Encode()` method called `simdEncode` (function pointer) for SIMD, then ran scalar cleanup. This meant every encode/decode paid function pointer overhead (~14ns) even when the SIMD path would handle everything.
+
+**Change:** Moved the scalar remainder loop into `doEncode` and `doDecode` directly. The public `Encode()`/`Decode()` methods now just call `simdEncode`/`simdDecode` which handle the complete job (SIMD bulk + scalar tail). No more function pointer overhead for the hot path.
+
+**Results (AMD EPYC Zen 4, A/B interleaved, median):**
+
+| Size | Before | After | Delta |
+|------|--------|-------|-------|
+| 30 B encode | 1.2 GB/s | 2.1 GB/s | +74% |
+| 60 B encode | 5.1 GB/s | 5.8 GB/s | +14% |
+| 30 B decode | 1.5 GB/s | 3.3 GB/s | +124% |
+| 60 B decode | 4.5 GB/s | 4.6 GB/s | +3% |
+| 400K encode | 34.5 GB/s | 36.2 GB/s | +5% |
+
+**Verdict: WIN.** The biggest gains are at small sizes where the function pointer overhead dominated. No regressions at any size.
+
+## Experiment 36: Dispatch Threshold Tuning — OPTIMIZATION
+
+**Method:** Ran `BenchmarkEncodeSchemes` and `BenchmarkDecodeSchemes` at all sizes from 12 to 1M bytes to find crossover points between tiers.
+
+**Encode thresholds (Zen 4):**
+
+| Range | Best path | Why |
+|-------|-----------|-----|
+| < 28 bytes | scalar only (doEncode returns immediately) | SIMD overhead exceeds benefit |
+| 28–119 bytes | encodeSSE | AVX2 gets too few iterations at this size |
+| 120–255 bytes | encodeSSEAVX2 (fused bookend) | Sweet spot for SSE+AVX2 fusion |
+| 256+ bytes (AVX-512) | encode512 + encodeSSE cleanup | 512-bit bulk dominates |
+| 120+ bytes (no AVX-512) | encodeSSEAVX2 | Best available without 512-bit |
+
+**Decode thresholds (Zen 4):**
+
+| Range | Best path | Why |
+|-------|-----------|-----|
+| < 16 bytes | scalar only | Not enough bytes for a single SSE iteration |
+| 16–44 bytes | decodeSSE | Handles small inputs efficiently |
+| 45+ bytes (AVX-512) | decodeVBMI | VPERMB compaction at 256-bit width |
+| 45+ bytes (no AVX-512) | decodeSSEAVX2 | Fused bookend pattern |
+
+**Key finding:** The SSE threshold for encode (120 bytes) is much higher than the naive estimate (~30 bytes for 2 iterations). This is because encodeSSEAVX2 gets its first AVX2 iteration at ~40 bytes input, but doesn't beat pure SSE until ~120 bytes due to the overhead of hoisting both SSE and AVX2 constants.
+
+## Experiment 37: AMD EPYC 9B45 (Zen 5) Benchmarks — 2x FASTER ENCODE
+
+**Server:** AMD EPYC 9B45 (Zen 5), 2 vCPUs. AVX-512 + VBMI supported. Unlike Zen 4 which double-pumps 512-bit ops, Zen 5 has wider execution units.
+
+**Results (GB/s, benchtime=1s, count=3):**
+
+### Encode
+| Size | simdenc | emmansun | cristalhq | stdlib | vs emmansun |
+|------|---------|----------|-----------|--------|-------------|
+| 64 B | 6.4 | 7.4 | 3.7 | 1.9 | 0.86x |
+| 256 B | 21.5 | 18.4 | 4.0 | 1.8 | **1.17x** |
+| 1 KB | 45.4 | 26.5 | 4.0 | 1.9 | **1.71x** |
+| 10 KB | 61.0 | 27.9 | 4.1 | 1.9 | **2.19x** |
+| 64 KB | 63.6 | 28.7 | 4.1 | 1.9 | **2.22x** |
+| 1 MB | 48.1 | 28.5 | 4.1 | 1.9 | **1.69x** |
+
+### Decode
+| Size | simdenc | emmansun | cristalhq | stdlib | vs emmansun |
+|------|---------|----------|-----------|--------|-------------|
+| 64 B | 5.7 | 4.3 | 3.7 | 2.4 | **1.33x** |
+| 256 B | 15.7 | 13.3 | 4.0 | 2.8 | **1.18x** |
+| 1 KB | 25.7 | 24.1 | 4.0 | 2.8 | **1.07x** |
+| 10 KB | 30.5 | 30.7 | 4.0 | 2.9 | 0.99x |
+| 64 KB | 31.2 | 32.4 | 4.0 | 2.9 | 0.96x |
+| 1 MB | 30.9 | 32.0 | 4.0 | 2.9 | 0.97x |
+
+### Zen 4 → Zen 5 comparison (simdenc only)
+| Size | Zen 4 enc | Zen 5 enc | Zen 4 dec | Zen 5 dec |
+|------|-----------|-----------|-----------|-----------|
+| 1 KB | 28.0 | 45.4 (+62%) | 10.0 | 25.7 (+157%) |
+| 10 KB | 36.0 | 61.0 (+69%) | 24.1 | 30.5 (+27%) |
+| 64 KB | 36.7 | 63.6 (+73%) | 24.4 | 31.2 (+28%) |
+| 1 MB | 34.9 | 48.1 (+38%) | 24.1 | 30.9 (+28%) |
+
+**Key findings:**
+
+1. **Encode scales dramatically on Zen 5.** Peak encode jumps from 36.7 to 63.6 GB/s (+73%). This strongly suggests Zen 5 executes 512-bit ops natively (single-pump) instead of double-pumping like Zen 4. Our `encode512` loop benefits directly because each 512-bit VPERMB, VPMULLW, VPMULHUW executes in one cycle instead of two.
+
+2. **Decode improvement is more modest.** Peak decode: 24.4 → 31.2 GB/s (+28%). Decode uses 256-bit VBMI (not 512-bit), so it doesn't benefit from wider execution. The 28% improvement is from general Zen 5 IPC gains and higher memory bandwidth.
+
+3. **emmansun encode barely improves on Zen 5** (23.4 → 28.7 GB/s, +23%). They use AVX2 (256-bit) only — their code doesn't benefit from 512-bit native execution. This is why our lead over them widens from 1.5x on Zen 4 to 2.2x on Zen 5.
+
+4. **Decode gap with emmansun at large sizes.** emmansun's hand-written AVX2 assembly is ~4% faster at 64KB+ decode. Both use the same algorithm (nibble-LUT validation + VPMADDUBSW + VPMADDWD), but their assembly avoids bounds checks and has tighter instruction scheduling. Our Go compiler-generated code has one extra bounds check per loop iteration and 3 extra SIMD instructions (special char handling).
+
+5. **1 MB encode drops from 63.6 to 48.1 GB/s.** This is L2/L3 cache pressure — 1 MB input + 1.33 MB output exceeds the per-core L2 cache. The 64 KB peak is entirely in L1/L2.
