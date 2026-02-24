@@ -277,6 +277,12 @@ func doEncode(alphabet uint8, dst, src []byte) {
 	}
 	if si > 0 {
 		di, si = encodeAVX2(a, dst, src, di, si)
+		// Overlapping tail: if the 24-byte stride skipped a valid position,
+		// call encodeAVX2 again at that position. It re-encodes some bytes
+		// identically (deterministic) but covers more of the remaining data.
+		if last := (n - 28) - (n-28)%3; last >= 4 && last < si && last+24 > si+6 {
+			di, si = encodeAVX2(a, dst, src, last/3*4, last)
+		}
 	}
 	for si+2 < n {
 		v := uint(src[si])<<16 | uint(src[si+1])<<8 | uint(src[si+2])
