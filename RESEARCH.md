@@ -920,3 +920,23 @@ Also works for LoadSlice: `s := src[si:]; archsimd.LoadUint8x32Slice(s[:32])`.
 | Individual func args | Yes | Yes | Same | Works, but too many params |
 | Struct pointer | Yes | No (LICM) | -22 to -27% | Rejected |
 | Closure capturing | No | Yes | -69 to -87% | Rejected — no intrinsic inlining |
+
+## Experiment 28: Slice Consumption Pattern — REGRESSION
+
+**Hypothesis**: Instead of tracking `si`/`di` indices, progressively consume slices: `s = s[32:]`, `d = d[24:]`. Loop body always works from index 0. This extends the reslice trick (experiment 27) to both loads and stores, potentially eliminating all index arithmetic.
+
+**Applied to**: encode512, encodeAVX2, decodeVBMI, decodeAVX2.
+
+**Results** (64KB, GB/s):
+
+| Configuration | Encode | Decode |
+|---|---|---|
+| Baseline (index + reslice trick) | 35.1 | 24.3 |
+| Full slice consumption (all funcs) | 34.5 | 22.2 |
+| Encode slice + decode index | 33.0 | 23.6 |
+
+**Root cause**: A slice is 3 words (ptr, len, cap) vs 1 word for an index. Each reslice (`s = s[32:]`) updates all 3 fields. Two slices (src + dst) = 6 values to keep live in the loop, vs 2 integers (si, di) with the index approach. In SIMD functions already using 10-11 hoisted YMM variables out of 16 available, this extra GP register pressure causes spilling.
+
+**Key insight**: The reslice trick (`d := dst[di:]` before `StoreSlice(d[:32])`) is the optimal balance — it gets bounds check elimination for the store without adding persistent register pressure in the loop. The reslice is a temporary that the compiler can optimize away after the store, while slice consumption makes the resliced values persistent across iterations.
+
+**Conclusion**: Slice consumption is an excellent general Go pattern (parsers, protocol decoders, streaming) but not suitable for SIMD hot loops at the register pressure cliff. Reverted to index-based loops with the reslice trick for stores only.
