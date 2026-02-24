@@ -940,3 +940,20 @@ Also works for LoadSlice: `s := src[si:]; archsimd.LoadUint8x32Slice(s[:32])`.
 **Key insight**: The reslice trick (`d := dst[di:]` before `StoreSlice(d[:32])`) is the optimal balance — it gets bounds check elimination for the store without adding persistent register pressure in the loop. The reslice is a temporary that the compiler can optimize away after the store, while slice consumption makes the resliced values persistent across iterations.
 
 **Conclusion**: Slice consumption is an excellent general Go pattern (parsers, protocol decoders, streaming) but not suitable for SIMD hot loops at the register pressure cliff. Reverted to index-based loops with the reslice trick for stores only.
+
+## Experiment 29: Independent Register Allocation via Separate Functions
+
+**Question**: Does Go's compiler respect branch-scoped register allocation? If we have two code paths (VBMI vs AVX2) in one function, do they get independent register budgets?
+
+**Finding**: The question is moot because Go does NOT inline the SIMD functions — they're too large. `doDecode` compiles to `CALL decodeVBMI` / `CALL decodeAVX2`. Each function gets fully independent register allocation by definition.
+
+**Register usage** (from assembly):
+
+| Function | YMM registers used | Count |
+|---|---|---|
+| decodeVBMI | Y0-Y13 | 14 of 16 |
+| decodeAVX2 | Y0-Y14 | 15 of 16 |
+
+Both functions independently saturate nearly all available YMM registers. decodeAVX2 uses one more (Y14) because it needs two extract constants (`extractShuffle` + `extractPermute`) vs VBMI's single `extractVBMI`.
+
+**Implication**: The two-level architecture (dispatcher → separate SIMD functions) is optimal precisely because each function gets its own full register budget. If they were merged into one function body, even with branches, the compiler would likely allocate globally across both paths, reducing the effective budget for each. This confirms the findings from experiment 23 (monolithic function body size) and experiment 26 (branch cost).
