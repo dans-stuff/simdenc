@@ -125,6 +125,28 @@ func init() {
 		return
 	}
 
+	// 512-bit constants (must be initialized here, not at package level,
+	// because LoadUint64x8 emits VMOVDQU64 which faults without AVX-512).
+	encShuffle512 = archsimd.LoadUint64x8(&[8]uint64{
+		0x0405030401020001, 0x0A0B090A07080607,
+		0x10110F100D0E0C0D, 0x1617151613141213,
+		0x1C1D1B1C191A1819, 0x222321221F201E1F,
+		0x2829272825262425, 0x2E2F2D2E2B2C2A2B,
+	}).AsUint8x64()
+	encMaskHi512 = archsimd.LoadUint64x8(&[8]uint64{maskHi, maskHi, maskHi, maskHi, maskHi, maskHi, maskHi, maskHi}).AsUint16x32()
+	encShiftHi512 = archsimd.LoadUint64x8(&[8]uint64{shiftHi, shiftHi, shiftHi, shiftHi, shiftHi, shiftHi, shiftHi, shiftHi}).AsUint16x32()
+	encMaskLo512 = archsimd.LoadUint64x8(&[8]uint64{maskLo, maskLo, maskLo, maskLo, maskLo, maskLo, maskLo, maskLo}).AsUint16x32()
+	encShiftLo512 = archsimd.LoadUint64x8(&[8]uint64{shiftLo, shiftLo, shiftLo, shiftLo, shiftLo, shiftLo, shiftLo, shiftLo}).AsUint16x32()
+	decHighBitMask512 = archsimd.LoadUint64x8(&[8]uint64{fill80, fill80, fill80, fill80, fill80, fill80, fill80, fill80}).AsUint8x64()
+	decCombinePairs512 = archsimd.LoadUint64x8(&[8]uint64{combPairs, combPairs, combPairs, combPairs, combPairs, combPairs, combPairs, combPairs}).AsInt8x64()
+	decCombineQuads512 = archsimd.LoadUint64x8(&[8]uint64{combQuads, combQuads, combQuads, combQuads, combQuads, combQuads, combQuads, combQuads}).AsInt16x32()
+	decExtract512 = archsimd.LoadUint64x8(&[8]uint64{
+		0x090A040506000102, 0x161011120C0D0E08,
+		0x1C1D1E18191A1415, 0x292A242526202122,
+		0x363031322C2D2E28, 0x3C3D3E38393A3435,
+		0, 0,
+	}).AsUint8x64()
+
 	// Per-alphabet AVX-512 tables (require loops to construct).
 	for idx, alpha := range encAlphabets {
 		// Encode: 64-entry ASCII offset table.
@@ -262,16 +284,11 @@ func encodeAVX2(alphabet uint8, a *encodeAlpha, dst, src []byte) int {
 // encShuffle512 is the 512-bit version of encSSEShuffle. It processes 48 src
 // bytes into 64 output bytes. Each 128-bit lane uses the same 3→4 pattern
 // but with byte indices offset by 12 per lane (12 src bytes per lane).
-var encShuffle512 = archsimd.LoadUint64x8(&[8]uint64{
-	0x0405030401020001, 0x0A0B090A07080607,
-	0x10110F100D0E0C0D, 0x1617151613141213,
-	0x1C1D1B1C191A1819, 0x222321221F201E1F,
-	0x2829272825262425, 0x2E2F2D2E2B2C2A2B,
-}).AsUint8x64()
-var encMaskHi512 = archsimd.LoadUint64x8(&[8]uint64{maskHi, maskHi, maskHi, maskHi, maskHi, maskHi, maskHi, maskHi}).AsUint16x32()
-var encShiftHi512 = archsimd.LoadUint64x8(&[8]uint64{shiftHi, shiftHi, shiftHi, shiftHi, shiftHi, shiftHi, shiftHi, shiftHi}).AsUint16x32()
-var encMaskLo512 = archsimd.LoadUint64x8(&[8]uint64{maskLo, maskLo, maskLo, maskLo, maskLo, maskLo, maskLo, maskLo}).AsUint16x32()
-var encShiftLo512 = archsimd.LoadUint64x8(&[8]uint64{shiftLo, shiftLo, shiftLo, shiftLo, shiftLo, shiftLo, shiftLo, shiftLo}).AsUint16x32()
+var encShuffle512 archsimd.Uint8x64
+var encMaskHi512 archsimd.Uint16x32
+var encShiftHi512 archsimd.Uint16x32
+var encMaskLo512 archsimd.Uint16x32
+var encShiftLo512 archsimd.Uint16x32
 
 // encode512 runs the 512-bit encode loop (48 src → 64 dst per iteration).
 func encode512(a *encodeAlpha, dst, src []byte) int {
@@ -418,19 +435,14 @@ func decodeAVX2(a *decodeAlpha, dst, src []byte) int {
 	return si
 }
 
-var decHighBitMask512 = archsimd.LoadUint64x8(&[8]uint64{fill80, fill80, fill80, fill80, fill80, fill80, fill80, fill80}).AsUint8x64()
-var decCombinePairs512 = archsimd.LoadUint64x8(&[8]uint64{combPairs, combPairs, combPairs, combPairs, combPairs, combPairs, combPairs, combPairs}).AsInt8x64()
-var decCombineQuads512 = archsimd.LoadUint64x8(&[8]uint64{combQuads, combQuads, combQuads, combQuads, combQuads, combQuads, combQuads, combQuads}).AsInt16x32()
+var decHighBitMask512 archsimd.Uint8x64
+var decCombinePairs512 archsimd.Int8x64
+var decCombineQuads512 archsimd.Int16x32
 
 // decExtract512 is the 512-bit version of the extract shuffle. It packs the
 // 3 good bytes from each 32-bit word across all 4 lanes (48 bytes total from
 // 64) into contiguous positions. The last 16 bytes are zeroed (unused).
-var decExtract512 = archsimd.LoadUint64x8(&[8]uint64{
-	0x090A040506000102, 0x161011120C0D0E08,
-	0x1C1D1E18191A1415, 0x292A242526202122,
-	0x363031322C2D2E28, 0x3C3D3E38393A3435,
-	0, 0,
-}).AsUint8x64()
+var decExtract512 archsimd.Uint8x64
 
 // decode512 runs the 512-bit VPERMI2B decode loop. Processes 64 src → 48 dst
 // bytes per iteration. Uses ConcatPermute (VPERMI2B) for combined validation +
