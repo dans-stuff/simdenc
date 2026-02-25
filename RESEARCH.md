@@ -28,6 +28,7 @@ Every non-obvious pattern in the codebase, with its measured A/B impact:
 | 20 | Closures capturing constants | -69% to -87% | REMOVED — SIMD intrinsics not inlined in closures |
 | 21 | By-value struct arguments | 0% (same as hoisting) | KEEP — replaces manual hoisting, cleaner code |
 | 22 | SIMD constant construction in init() | 0% | KEEP — cleaner init, Broadcast256 pitfall documented |
+| 44 | SIMD constant declaration strategies | -5% to -6% for alternatives | FINDING — package-level var + As cast is optimal |
 
 ## Server: AMD EPYC Zen 4
 
@@ -1379,3 +1380,92 @@ Full Uint8x64 method inventory (ops relevant to base64):
 
 **Not shipped.** The prototype validates the approach but introduces a hand-written assembly file, which defeats the project's goal of pure Go with compiler intrinsics. Parked until archsimd exposes VPMULTISHIFTQB.
 
+
+## Experiment 43: VPTERNLOGD Auto-Fusion Verification
+
+**Test:** Does Go 1.26rc1's compiler auto-fuse And/Or/Xor chains into VPTERNLOGD?
+
+**Method:** Added `//go:noinline` function `ternCheck(a, b, c Uint8x32) = a.Or(b).Or(c)` and inspected assembly via `-gcflags='-S'`.
+
+**Result: NO FUSION.**
+
+```asm
+// ternCheck: a.Or(b).Or(c)
+VPOR Y0, Y1, Y1    // tmp = a | b
+VPOR Y1, Y2, Y0    // result = tmp | c
+RET
+```
+
+Two separate VPOR instructions. No VPTERNLOGD emitted anywhere in the entire simdenc build (0 occurrences across 37 total VPOR/VPAND/VPXOR instructions).
+
+**Also checked:** Full `go build -gcflags='-S'` of simdenc: zero VPTERNLOGD in the entire binary. The rewrite rules documented in archsimd's codegen YAML ("should only appear in rewrite rules") are either:
+1. Not yet implemented in Go 1.26rc1, or
+2. Only trigger for patterns not present in our code
+
+**Impact:** VPTERNLOGD is effectively unavailable — neither callable nor auto-generated. This doesn't affect our current code (no 3-operand boolean chains in hot loops), but rules out any optimization that depends on it.
+
+### Summary Table
+
+| Instruction | archsimd status | Width available | Usable for base64? |
+|---|---|---|---|
+| VPMULTISHIFTQB | **Not exposed** | N/A | Encode sextet extraction — assembly only |
+| VPTERNLOGD | Unexported (`tern`) | 128/256/512 | Maybe auto-fused by compiler |
+| VPERMI2B | **Public** (`ConcatPermute`) | 128/256/512 | Decode LUT needs 512-bit (128 entries) |
+| VPTEST (IsZero) | Public | 128/256 only | 512-bit workaround: Equal+ToBits |
+| VPCOMPRESSB | Public (`Compress`) | 512 | Not useful (byte-level, not bit-level) |
+| NT stores | **Not exposed** | N/A | No cache control available |
+| Prefetch | **Not exposed** | N/A | No cache control available |
+
+
+## Experiment 44: SIMD Constant Declaration Strategies — KEY FINDING
+
+**Question:** SIMD code requires many lookup tables, shuffle masks, and broadcast constants. What is the best way to declare them using Go's `simd/archsimd` intrinsics?
+
+**Three approaches tested** (encode512, 65536B input, AMD EPYC Zen 5):
+
+| Approach | Assembly per 512-bit constant | ns/op | MB/s | Delta |
+|---|---|---|---|---|
+| A: Package-level var with `.As*()` cast, shadowed into local | 1 `VMOVDQU64` from .data | ~1920 | ~34,100 | baseline |
+| B: Package-level `LoadUint64x8` (no cast), `.As*()` in function | 1 `VMOVDQU64` + extra ref? | ~2020 | ~32,400 | **-5%** |
+| C: Fully inline (declared inside function body) | 8 MOVQ imm + 8 MOVQ stack + 1 VMOVDQU64 | ~1960 | ~33,400 | **-6%** |
+
+**Approach A (winner):**
+```go
+// Package level: Load + As in one expression
+var encMaskHi512 = archsimd.LoadUint64x8(&[8]uint64{...}).AsUint16x32()
+
+// Function body: shadow into local (hoisting for LICM workaround)
+func encode512(...) {
+    maskHi512 := encMaskHi512
+    ...
+}
+```
+Compiles to a single `VMOVDQU64 symbol(SB), ZMM` per constant. The entire 512-bit value lives in the `.data` section and loads directly into a ZMM register. Function total: 204 bytes, NOSPLIT, 8 bytes stack. 5 loads for 5 constants.
+
+**Approach B (Load at package level, cast in function):**
+```go
+var encMaskHi512Raw = archsimd.LoadUint64x8(&[8]uint64{...})  // Uint64x8, no cast
+func encode512(...) {
+    maskHi512 := encMaskHi512Raw.AsUint16x32()  // cast here
+    ...
+}
+```
+~5% slower. The compiler apparently doesn't fully elide the type reference indirection.
+
+**Approach C (fully inline):**
+```go
+func encode512(...) {
+    maskHi512 := archsimd.LoadUint64x8(&[8]uint64{...}).AsUint16x32()
+    ...
+}
+```
+The compiler cannot materialize 512-bit immediates directly into ZMM registers. Each constant requires building on the stack: 8 `MOVQ` immediates into registers, 8 `MOVQ` stores to stack slots, then 1 `VMOVDQU64` from stack. That's 17 instructions per constant vs 1 instruction for approach A. Function total: 701 bytes, 328 bytes stack. ~6% regression.
+
+**Recommendation for Go SIMD intrinsics users:**
+
+1. Express repeating byte patterns as named `uint64` constants with comments explaining the pattern
+2. Declare SIMD vectors as package-level `var` with `Load` + `.As*()` in one expression
+3. Shadow into locals at the top of the function body (Go lacks LICM, see Experiment 18)
+4. Place each function's constants immediately above the function for locality
+
+This pattern gives optimal codegen (single load per constant), readable declarations (named patterns with comments), and clean function bodies (short shadow block).
