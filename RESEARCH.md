@@ -1178,3 +1178,168 @@ Both functions accept `(di, si)` parameters so they can be called as cleanup aft
 4. **Decode gap with emmansun at large sizes.** emmansun's hand-written AVX2 assembly is ~4% faster at 64KB+ decode. Both use the same algorithm (nibble-LUT validation + VPMADDUBSW + VPMADDWD), but their assembly avoids bounds checks and has tighter instruction scheduling. Our Go compiler-generated code has one extra bounds check per loop iteration and 3 extra SIMD instructions (special char handling).
 
 5. **1 MB encode drops from 63.6 to 48.1 GB/s.** This is L2/L3 cache pressure — 1 MB input + 1.33 MB output exceeds the per-core L2 cache. The 64 KB peak is entirely in L1/L2.
+
+
+## Experiment 38: archsimd API Audit (Go 1.26rc1)
+
+Definitive inventory of AVX-512 instructions relevant to base64 optimization in `simd/archsimd`.
+
+### VPMULTISHIFTQB — NOT AVAILABLE
+
+**Status:** Not exposed in archsimd at any level (no public method, no unexported method).
+
+**Evidence:**
+- `grep -ri "multishift\|MultishiftQB" $GOROOT/src/simd/archsimd/` → zero results
+- Not present in `ops_amd64.go`, `ops_internal_amd64.go`, `extra_amd64.go`, `shuffles_amd64.go`, or any codegen YAML
+- The Go assembler DOES know the mnemonic (`AVPMULTISHIFTQB` in `cmd/internal/obj/x86/aenum.go`), so it can be used from hand-written `.s` files
+
+**Impact:** Cannot replace the 4-instruction mulhi/mullo sextet extraction in `encode512` with a single instruction via intrinsics. Workaround: hand-written Go assembly (see Experiment 41).
+
+### VPTERNLOGD — UNEXPORTED (compiler auto-fusion only)
+
+**Status:** Present as unexported `tern()` method on Int32/Uint32/Int64/Uint64 types at all widths (128/256/512). Located in `ops_internal_amd64.go` lines 596-692.
+
+**Evidence:**
+```go
+// ops_internal_amd64.go
+func (x Uint32x16) tern(table uint8, y Uint32x16, z Uint32x16) Uint32x16
+// Asm: VPTERNLOGD, CPU Feature: AVX512
+```
+
+**Design intent** (from `_gen/simdgen/ops/BitwiseLogic/categories.yaml`):
+> "We also have PTEST and VPTERNLOG, those should be hidden from the users and only appear in rewrite rules."
+
+The compiler's SSA rewrite rules are supposed to auto-fuse `And`/`Or`/`Xor`/`AndNot` chains into VPTERNLOGD. Whether this actually happens needs verification (see Experiment 43).
+
+**Impact:** Cannot call directly. If auto-fusion works, our existing boolean expressions may already benefit. If not, there's no workaround short of assembly.
+
+### ConcatPermute (VPERMI2B) — FULLY AVAILABLE at all widths
+
+**Status:** Public method on `Uint8x16`, `Uint8x32`, `Uint8x64` (and signed variants).
+
+**Evidence:**
+```go
+// ops_amd64.go:1307
+func (x Uint8x32) ConcatPermute(y Uint8x32, indices Uint8x32) Uint8x32
+// Asm: VPERMI2B, CPU Feature: AVX512VBMI
+
+// ops_amd64.go:1323
+func (x Uint8x64) ConcatPermute(y Uint8x64, indices Uint8x64) Uint8x64
+// Asm: VPERMI2B, CPU Feature: AVX512VBMI
+```
+
+**Index semantics:** "Only the needed bits to represent xy's index are used in indices' elements."
+- At 256-bit: xy is 64 bytes, so indices use low 6 bits (0-63). Selects from 64 entries.
+- At 512-bit: xy is 128 bytes, so indices use low 7 bits (0-127). Selects from 128 entries.
+
+**Impact for decode (Experiment 39):** At 256-bit, ConcatPermute selects from 64 bytes — NOT enough for the paper's 128-entry decode LUT (needs to map all 128 ASCII values). At 512-bit, it selects from 128 bytes — exactly what the paper needs. This means the VPERMI2B decode optimization requires either:
+1. A 512-bit ConcatPermute (requires 512-bit decode pipeline — ties to Experiment 40), or
+2. A different encoding of the LUT that fits in 64 entries at 256-bit
+
+**Option 2 analysis:** Base64 uses ASCII values in ranges 0x2B-0x7A. With 64 entries at 256-bit, we can only index 0-63. ASCII 'A' is 0x41 (65) — already out of range. So 256-bit ConcatPermute CANNOT directly implement the paper's decode LUT. We'd need to subtract a base offset first, which adds an instruction and still can't handle the full ASCII range in 64 entries.
+
+**Conclusion:** The VPERMI2B decode translation requires 512-bit width. This couples Task 2 (VPERMI2B decode) with Task 3 (512-bit decode). They should be attempted together.
+
+### IsZero — NOT AVAILABLE at 512-bit
+
+**Status:** Available on all 128-bit and 256-bit integer vector types. NOT available on any 512-bit type.
+
+**Evidence:**
+```
+// extra_amd64.go — all IsZero signatures (exhaustive):
+func (x Uint8x16) IsZero() bool
+func (x Uint8x32) IsZero() bool
+func (x Int8x16) IsZero() bool
+func (x Int8x32) IsZero() bool
+// ... Int16x8, Int16x16, Int32x4, Int32x8, Int64x2, Int64x4
+// ... Uint16x8, Uint16x16, Uint32x4, Uint32x8, Uint64x2, Uint64x4
+// NO 512-bit variants (no Uint8x64, Int8x64, etc.)
+```
+
+**Workaround options:**
+1. `vec.Equal(zero).ToBits() == 0` — `Mask8x64.ToBits()` returns `uint64`, confirmed available. Cost: VPCMPB (k-register) + KMOVQ + TEST. Likely 2-3 cycles vs 1 cycle for VPTEST.
+2. Split to 256-bit halves: `vec.GetHi().Or(vec.GetLo()).IsZero()` — VEXTRACTI + VPOR + VPTEST. Also 2-3 cycles.
+3. For decode validation specifically: check the high bit of all bytes. `vec.Greater(threshold)` produces a Mask8x64, then `.ToBits() != 0` detects any invalid byte.
+
+### Non-temporal Stores and Prefetch — NOT AVAILABLE
+
+**Evidence:** `grep -rn "NonTemporal\|StreamStore\|Prefetch\|NTStore" $GOROOT/src/simd/archsimd/` → zero results. No cache control instructions exposed. L1-chunked processing (Experiment 42) cannot use NT stores via archsimd.
+
+### Additional 512-bit Operations Available
+
+Full Uint8x64 method inventory (ops relevant to base64):
+- `Add`, `Sub`, `SubSaturated`, `And`, `Or`, `Xor`, `AndNot` — all arithmetic/bitwise
+- `Equal`, `Greater`, `Less` etc. → `Mask8x64` → `.ToBits() uint64`
+- `Permute(Uint8x64)` — VPERMB, full cross-lane (already used in encode512)
+- `PermuteOrZeroGrouped(Int8x64)` — VPSHUFB, per-128-bit-lane
+- `ConcatPermute(Uint8x64, Uint8x64)` — VPERMI2B, 128-entry lookup
+- `Compress(Mask8x64)` — VPCOMPRESSB
+- `DotProductPairsSaturated(Int8x64)` → `Int16x32` — VPMADDUBSW at 512-bit
+- `GetHi()`/`GetLo()` → Uint8x32, `SetHi()`/`SetLo()` for width conversion
+- `Broadcast512()` on Uint8x16 to fill all 4 lanes
+
+
+## Experiment 40: L2-Chunked Encode for Large Inputs
+
+**Hypothesis:** Processing large inputs in L2-friendly chunks (24K-192K) should sustain near-peak throughput at 1MB+ by keeping the working set in L2 cache.
+
+**Method:** Wrapped `encode512` in a chunking loop that processes `chunkSrc` input bytes at a time (multiple of 48, encode512's stride). Tested chunk sizes: 24K, 48K, 96K, 192K. Compared against unchunked encode512 at 131K, 1M, 4M, 16M.
+
+**Results (AMD EPYC Zen 4):**
+
+| Size | Unchunked | 24K | 48K | 96K | 192K |
+|---|---|---|---|---|---|
+| 131K | 32.1 GB/s | 34.0 GB/s | 32.1 GB/s | 31.2 GB/s | 33.1 GB/s |
+| 1M | 30.1 GB/s | 30.0 GB/s | 29.1 GB/s | 30.4 GB/s | 31.0 GB/s |
+| 4M | 30.1 GB/s | 30.0 GB/s | 29.8 GB/s | 31.0 GB/s | 30.1 GB/s |
+| 16M | 18.1 GB/s | 18.1 GB/s | 19.4 GB/s | 19.1 GB/s | 18.4 GB/s |
+
+**Result: NEGLIGIBLE BENEFIT.** All measurements within noise at 1M and 4M. At 16M, 48K chunks show ~7% improvement (18.1→19.4 GB/s), but this is marginal and inconsistent.
+
+**Analysis:** The theoretical prediction was correct: base64 encode is a single-pass streaming algorithm. It never re-reads data, so cache eviction doesn't cause misses. The hardware prefetcher handles linear sequential access patterns well. The throughput drop at large sizes is a **fundamental memory bandwidth limit** (L2→L3→DRAM latency), not a cache reuse problem.
+
+**What would actually help:**
+- **Non-temporal stores** (VMOVNTDQ): bypass L2 cache for dst writes, freeing cache capacity for src reads. ~20-30% improvement expected at DRAM-bound sizes.
+- **Software prefetch** (PREFETCHT0): pre-load src data ahead of consumption.
+- Neither is available in archsimd (confirmed in Experiment 38).
+
+**Conclusion:** The 1M encode regression (~9% on Zen 4) and 16M regression (~44%) are inherent memory bandwidth limits. No pure-software chunking approach can address this without NT stores or prefetch. The code was NOT modified — chunking is not worth the complexity for negligible gain.
+
+
+## Experiment 41: VPMULTISHIFTQB Encode via Assembly (3-Instruction Hot Loop)
+
+**Hypothesis:** Replace the 5-instruction mulhi/mullo sextet extraction (AND + MULHIGH + AND + MUL + OR) with a single VPMULTISHIFTQB instruction, which extracts all 8 sextets from each 64-bit lane in one operation. Requires a Go assembly (.s) file since archsimd doesn't expose VPMULTISHIFTQB.
+
+**Design:**
+- New byte grouping shuffle: packs 6 source bytes per qword in big-endian order [s2,s1,s0,s5,s4,s3,x,x] so VPMULTISHIFTQB sees contiguous 6-bit fields within each 64-bit lane.
+- Shift vector: [18, 12, 6, 0, 42, 36, 30, 24] per qword — extracts 4 sextets from each of 2 triples packed into one 64-bit lane.
+- Direct ASCII LUT: maps sextet → ASCII directly (not offset), so the pipeline is just VPERMB → VPMULTISHIFTQB → VPERMB. No ADD needed since VPERMB only uses the low 6 bits of each index.
+- Full loop in assembly to avoid per-iteration function call overhead.
+
+**Implementation:** Added `base64_amd64.s` with `encode512ms` function using Go's ABI0 calling convention. Constants defined as GLOBL/DATA in the .s file. Go side: `//go:noescape` declaration, `directLUT [64]byte` field on `encodeAlpha`.
+
+**Results (AMD EPYC Zen 4, double-pumps 512-bit):**
+
+| Size | simd (mulhi/mullo) | multishift (VPMULTISHIFTQB) | Δ |
+|---|---|---|---|
+| 256 | 12.6 GB/s | 27.0 GB/s | **+115%** |
+| 1K | 23.7 GB/s | 46.5 GB/s | **+96%** |
+| 10K | 33.2 GB/s | 61.9 GB/s | **+86%** |
+| 65K | 32.5 GB/s | 40.6 GB/s | **+25%** |
+| 131K | 31.6 GB/s | 41.7 GB/s | **+32%** |
+| 1M | 29.9 GB/s | 35.1 GB/s | **+17%** |
+| 4M | 28.6 GB/s | 33.7 GB/s | **+18%** |
+| 16M | 18.0 GB/s | 17.4 GB/s | ~0% (bandwidth-limited) |
+
+**Key observations:**
+
+1. **+86-115% at compute-bound sizes (256B-10K).** The 3-instruction loop vs 7-instruction loop translates almost directly to 2x throughput when not memory-bound.
+2. **61.9 GB/s encode at 10K on Zen 4** — this is within striking distance of aklomp's C implementation (which uses the same VPMULTISHIFTQB approach). On Zen 5 (single-pump), expect even higher.
+3. **+17-32% at L2/L3-bound sizes (65K-4M).** Even when memory bandwidth starts limiting, fewer instructions per iteration still helps — less time wasted on instruction decode/execution leaves more bandwidth for memory operations.
+4. **Convergence at 16M.** Both paths hit the same DRAM bandwidth wall.
+5. **Broadcast512 pitfall avoided.** The constants are defined as 64-byte DATA blocks in the .s file, avoiding the `Broadcast512()` element-zero trap discovered in Experiment 39.
+
+**Assembly maintenance cost:** The `.s` file is 52 lines with 3 SIMD instructions in the hot loop. The assembly is simple enough that it's unlikely to need changes unless the function signature changes. If Go adds VPMULTISHIFTQB to archsimd in a future release, the .s file can be deleted and replaced with intrinsics.
+
+**Not shipped.** The prototype validates the approach but introduces a hand-written assembly file, which defeats the project's goal of pure Go with compiler intrinsics. Parked until archsimd exposes VPMULTISHIFTQB.
+
