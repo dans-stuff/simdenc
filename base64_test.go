@@ -99,6 +99,24 @@ func TestAppendEncode(t *testing.T) {
 	}
 }
 
+func TestWithPadding(t *testing.T) {
+	src := randbytes(t, 100)
+	enc := StdEncoding.WithPadding('#')
+	std := base64.StdEncoding.WithPadding('#')
+	encoded := enc.EncodeToString(src)
+	want := std.EncodeToString(src)
+	if encoded != want {
+		t.Fatalf("WithPadding encode mismatch:\n  got:  %q\n  want: %q", encoded, want)
+	}
+	decoded, err := enc.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("WithPadding decode: %v", err)
+	}
+	if !bytes.Equal(decoded, src) {
+		t.Fatal("WithPadding roundtrip mismatch")
+	}
+}
+
 func TestAppendDecode(t *testing.T) {
 	src := randbytes(t, 100)
 	encoded := base64.RawStdEncoding.EncodeToString(src)

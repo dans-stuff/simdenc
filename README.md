@@ -52,55 +52,63 @@ CPU features are detected at init. The best available path is selected automatic
 
 Each tier is its own function that hoists only its own constants. A tiny dispatch function selects the tier based on input size and CPU features. This matters because the Go compiler allocates registers per-function, so merging tiers into one function causes spills and 50%+ regressions.
 
-## What I learned
+## What I learned about `simd/archsimd`
 
-I built this to see what Go 1.26's SIMD intrinsics can actually do. Base64 is a well-studied problem with decades of SIMD research, so it's a good test case. Every optimization was A/B tested on EPYC Zen 4 and Zen 5.
+I built this to test Go 1.26's SIMD intrinsics, using base64 as the workload. Every finding below comes from 44 A/B tests on AMD EPYC Zen 4 and Zen 5. The archsimd-specific lessons apply to any SIMD Go code; the base64-specific findings are in the next section.
 
-### VPERMB and VPERMI2B are the big wins
+### How to declare SIMD constants
 
-VPERMB rearranges any of 64 bytes into any order in a single instruction. Base64 encoding converts 6-bit values to ASCII characters, which normally takes 4 operations. VPERMB turns it into a 64-entry lookup table and does it in one shot. That's where most of the AVX-512 encode speedup comes from.
+Express byte patterns as named `uint64` constants, then declare vectors as package-level `var` with `Load` + `.As*()` in one expression. Shadow into locals at the top of each function body (LICM workaround — see below).
 
-VPERMI2B (exposed as `ConcatPermute` in archsimd) does the same thing but across a 128-entry table formed by concatenating two 64-byte registers. For decode, this replaces the entire nibble-LUT validation+translation pipeline (6 instructions: shift, mask, two LUT lookups, compare, add) with a single instruction that validates and translates simultaneously. Invalid characters produce 0x80, which is caught by a simple bit check. This is the single biggest optimization in the project, roughly doubling decode throughput.
+```go
+const maskHi = uint64(0x0FC0FC000FC0FC00) // AND mask: keep bits [11:6]
 
-### 512-bit helps both encode and decode
+var encMaskHi512 = archsimd.LoadUint64x8(&[8]uint64{
+    maskHi, maskHi, maskHi, maskHi, maskHi, maskHi, maskHi, maskHi,
+}).AsUint16x32()
 
-Going from 256-bit to 512-bit vectors made encoding 55% faster on Zen 4 (and over 2x on Zen 5). Decode initially got 12% *slower* with 512-bit vectors when using the same nibble-LUT algorithm. But switching to the VPERMI2B-based algorithm at 512-bit width changed the picture: the shorter pipeline (1 instruction for validate+translate instead of 6) more than compensates for Zen 4's 512-bit double-pumping. Decode is now 2x the 256-bit path at 10 KB+.
+func encode512(dst, src []byte) {
+    mask := encMaskHi512 // shadow into local — stays in register
+    // ...
+}
+```
 
-### Waterfall dispatch
-
-Each SIMD tier is a standalone function. The dispatcher tries AVX-512 first, then AVX2, then SSE, each picking up where the previous left off. Early experiments used a "fused bookend" approach where SSE wrapped AVX2 (processing the first and last bytes with SSE, filling the middle with AVX2). Benchmarking showed the unfused waterfall is 12-18% faster at all sizes because each standalone function gets cleaner register allocation. SSE now only runs as cleanup after the wider tier finishes.
+Why this matters: declaring constants inline inside the function body forces the compiler to build each 512-bit value on the stack (8 `MOVQ` immediates + 8 `MOVQ` stores + 1 `VMOVDQU64` — 17 instructions per constant), causing a ~6% regression vs a single `VMOVDQU64` load from `.data`. Moving just the `.As*()` cast into the function is also ~5% slower. (Experiment 44.)
 
 ### Go has no LICM
 
-Global variables are reloaded from memory on every loop iteration, even when there are no stores or function calls in the loop body. Go's compiler simply doesn't implement Loop Invariant Code Motion ([golang/go#15808](https://github.com/golang/go/issues/15808)). The workaround is copying each global into a local before the loop (`v := globalVec`). Locals are register-eligible, so they stay in registers across iterations. This gave +37% for encode and +32% for decode.
+Global variables are reloaded from memory on every loop iteration, even when there are no stores or function calls in the loop body. Go's compiler doesn't implement Loop Invariant Code Motion ([golang/go#15808](https://github.com/golang/go/issues/15808)). The workaround is copying each global into a local before the loop (`v := globalVec`). Locals are register-eligible, so they stay in registers across iterations. This gave +37% for encode and +32% for decode.
+
+### One SIMD tier per function
+
+Register allocation is per-function. Merging SIMD tiers (e.g. SSE + AVX2) into one function causes spills and 50%+ regressions at all sizes above 100 bytes. Even adding a 3-line size check to a dispatch function degrades the SIMD callees. Keep dispatch functions tiny: a size check and a tail call, nothing else.
 
 ### Closures kill SIMD inlining
 
-We tried a closure approach where a factory function captures all constants and returns the inner function. The captured values were hoisted correctly (loaded once, not reloaded per iteration). But Go's compiler won't inline SIMD intrinsics inside closure bodies. `LoadUint8x32Slice` and `StoreSlice` become real `CALL` instructions instead of inline VMOVDQU. 7-8x slowdown, capping throughput at ~6 GB/s regardless of input size. This happens even when the closure is called directly from a local variable, so it's a compiler limitation, not a devirtualization issue.
+Go's compiler won't inline SIMD intrinsics inside closure bodies. `LoadUint8x32Slice` and `StoreSlice` become real `CALL` instructions instead of inline VMOVDQU. 7-8x slowdown, capping throughput at ~6 GB/s regardless of input size. This happens even when the closure is called directly from a local variable — it's a compiler limitation, not a devirtualization issue.
 
-### Small functions or nothing
+### `Broadcast512` broadcasts element zero
 
-Each SIMD tier is its own function with ~6-7 hoisted constants. Merging them into one function hurts at all sizes above 100 bytes because the compiler manages register allocation for all code paths simultaneously. Even adding a 3-line size check to a dispatch function can degrade the SIMD callees by 50%. Keep dispatch functions tiny: no constant hoisting, no loops, just a size check and a tail call.
-
-### Broadcast512 doesn't do what you'd expect
-
-`Uint8x16.Broadcast512()` broadcasts *element zero* (a single byte via VPBROADCASTB), not the entire 128-bit lane. To replicate a 128-bit pattern across all lanes of a 512-bit register, you need `SetLo`/`SetHi` chains. The Go team plans to recognize this pattern and optimize it to VBROADCASTI32X4 in a future release.
-
-### VPMULTISHIFTQB would make encode even faster
-
-We prototyped a VPMULTISHIFTQB-based encode path in hand-written Go assembly. It reduces the encode inner loop from 7 SIMD instructions to 3 (VPERMB + VPMULTISHIFTQB + VPERMB), giving +37-125% encode throughput depending on size. But archsimd doesn't expose VPMULTISHIFTQB, so this can't ship as pure Go. It's the single biggest missing intrinsic for this workload.
+`Uint8x16.Broadcast512()` broadcasts *element zero* (a single byte via VPBROADCASTB), not the entire 128-bit lane. To replicate a 128-bit pattern across all lanes of a 512-bit register, you need `SetLo`/`SetHi` chains.
 
 ### Alignment doesn't matter
 
-archsimd uses VMOVDQU/VMOVDQU64 (unaligned loads) for all vector operations. At 256-bit width there's zero measurable penalty for misaligned data. At 512-bit width there's ~8% penalty for misaligned addresses, but Go's allocator naturally aligns heap memory. Not worth worrying about in practice.
+archsimd uses VMOVDQU/VMOVDQU64 (unaligned loads) everywhere. Go's allocator naturally aligns heap memory. Not worth worrying about in practice.
 
-### unsafe.Pointer loads: 0% improvement
+### What's not in archsimd yet
 
-We tried bypassing the safe `LoadSlice` API with raw pointer arithmetic. No difference. The compiler already eliminates bounds checks when you give it explicit slice bounds like `src[i:i+32]`.
+- **VPMULTISHIFTQB:** not exposed (would 2x our encode — see below)
+- **VPTERNLOGD:** unexported `tern()` method, compiler auto-fusion doesn't trigger (0 VPTERNLOGD emissions in our entire build)
+- **IsZero at 512-bit:** missing (workaround: `Equal(zero).ToBits()`)
+- **Non-temporal stores, prefetch:** not exposed
 
-### Rosetta 2 weirdness
+## Base64-specific findings
 
-Byte-identical x86 machine code in the same binary can run at completely different speeds under Rosetta 2, depending on where the function lands in memory. We copied a competitor's assembly function verbatim into our binary: the original ran at 6.3 GB/s, our copy ran at 2.2 GB/s, same instructions. Not actionable, just interesting.
+VPERMB (`Permute` in archsimd) is a 64-entry byte lookup in a single instruction. For encode, it replaces the 4-operation range-based sextet-to-ASCII translation. VPERMI2B (`ConcatPermute`) does the same across a 128-entry table formed by concatenating two 64-byte registers. For decode, it replaces the entire nibble-LUT validation+translation pipeline (6 instructions: shift, mask, two LUT lookups, compare, add) with one instruction that validates and translates simultaneously. Invalid characters produce 0x80, caught by a simple bit check. VPERMI2B is the single biggest optimization in the project, roughly doubling decode throughput.
+
+512-bit vectors help both encode and decode once you switch to the right algorithm. Encode was 55% faster on Zen 4 (over 2x on Zen 5). Decode initially got 12% *slower* at 512-bit with the same nibble-LUT algorithm, but VPERMI2B's shorter pipeline (1 instruction vs 6) more than compensates for Zen 4's 512-bit double-pumping. We also prototyped a VPMULTISHIFTQB-based encode path in hand-written Go assembly: a 3-instruction hot loop (VPERMB + VPMULTISHIFTQB + VPERMB) that runs +86-115% faster at compute-bound sizes. It can't ship without the intrinsic, but validates what's possible when archsimd catches up.
+
+Byte-identical x86 machine code in the same binary can run at completely different speeds under Rosetta 2, depending on where the function lands in memory — same instructions, 3x performance gap. Not actionable, just interesting.
 
 See [RESEARCH.md](RESEARCH.md) for the full experiment log.
 
