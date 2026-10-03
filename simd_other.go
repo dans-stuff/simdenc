@@ -6,3 +6,5 @@ package simdenc
 
 func encodeBlocks(alphabet uint8, dst, src []byte) int { return 0 }
 func decodeBlocks(alphabet uint8, dst, src []byte) int { return 0 }
+func hexEncodeBlocks(dst, src []byte) int              { return 0 }
+func hexDecodeBlocks(dst, src []byte) int              { return 0 }
