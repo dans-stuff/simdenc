@@ -2,10 +2,14 @@
 
 package simdenc
 
-import (
-	"os"
-	"simd/archsimd"
+import "simd/archsimd"
+
+const (
+	encodeStdAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	encodeURLAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+
+var encAlphabets = [2]string{encodeStdAlpha, encodeURLAlpha}
 
 // Per-alphabet encode constants.
 type encodeAlpha struct {
@@ -110,17 +114,8 @@ var decAlphas = [2]decodeAlpha{
 	},
 }
 
-var hasAVX2 = archsimd.X86.AVX2() && os.Getenv("SIMDENC_NO_AVX2") == ""
-var hasAVX512 = hasAVX2 && archsimd.X86.AVX512() && archsimd.X86.AVX512VBMI() && os.Getenv("SIMDENC_NO_AVX512") == ""
-
-// init sets the SIMD dispatch functions and builds per-alphabet AVX-512 LUTs.
+// init builds the AVX-512 constants and per-alphabet LUTs.
 func init() {
-	if !hasAVX2 {
-		return
-	}
-	simdEncode = doEncode
-	simdDecode = doDecode
-
 	if !hasAVX512 {
 		return
 	}
@@ -164,18 +159,7 @@ func init() {
 		encAlphas[idx].asciiTable512 = archsimd.LoadUint8x64(&t512)
 
 		// Decode: VPERMI2B LUT (128-entry table split across two Uint8x64).
-		var lo, hi [64]byte
-		for i := range 64 {
-			lo[i] = 0x80
-			hi[i] = 0x80
-		}
-		for i, c := range alpha {
-			if c < 64 {
-				lo[c] = byte(i)
-			} else {
-				hi[c-64] = byte(i)
-			}
-		}
+		lo, hi := decodeLUT(alpha)
 		decAlphas[idx].lutLo = archsimd.LoadUint8x64(&lo)
 		decAlphas[idx].lutHi = archsimd.LoadUint8x64(&hi)
 	}
@@ -313,22 +297,24 @@ func encode512(a *encodeAlpha, dst, src []byte) int {
 	return si
 }
 
-// doEncode runs the SIMD waterfall and returns source bytes consumed.
-// Caller guarantees len(src) >= 16 and handles any remainder via stdlib.
-func doEncode(alphabet uint8, dst, src []byte) int {
-	n := len(src)
+// encodeBlocks encodes as many whole 3-byte groups as it can, widest vectors
+// first, and returns the source bytes consumed.
+func encodeBlocks(alphabet uint8, dst, src []byte) int {
+	if !hasAVX2 {
+		return 0
+	}
 	si := 0
-
-	if hasAVX512 && n >= 64 {
-		si = encode512(&encAlphas[alphabet], dst, src)
-	} else if n >= 36 {
-		si = encodeAVX2(alphabet, &encAlphas[alphabet], dst, src)
+	if hasAVX512 && len(src) >= 64 {
+		si += encode512(&encAlphas[alphabet], dst, src)
+	} else if len(src) >= 36 {
+		// Not run after the 512-bit loop: the 36-63 bytes it leaves get at most
+		// one iteration, and its scalar preamble made that 20-40% slower than
+		// going straight to SSE (Zen 5, 100 B and 1000 B inputs).
+		si += encodeAVX2(alphabet, &encAlphas[alphabet], dst, src)
 	}
-	di := si * 4 / 3
-	if si+16 <= n {
-		si += encodeSSE(alphabet, dst[di:], src[si:])
+	if len(src)-si >= 16 {
+		si += encodeSSE(alphabet, dst[si/3*4:], src[si:])
 	}
-
 	return si
 }
 
@@ -484,22 +470,23 @@ func decode512(a *decodeAlpha, dst, src []byte) int {
 	return si
 }
 
-// doDecode runs the SIMD waterfall and returns (decoded bytes, source bytes
-// consumed). Caller guarantees len(src) >= 16 and handles any remainder via stdlib.
-func doDecode(alphabet uint8, dst, src []byte) (int, int) {
-	n := len(src)
+// decodeBlocks decodes as many whole 4-character groups as it can, widest
+// vectors first, stopping at the first block with an invalid character. It
+// returns the source bytes consumed.
+func decodeBlocks(alphabet uint8, dst, src []byte) int {
+	if !hasAVX2 {
+		return 0
+	}
 	a := &decAlphas[alphabet]
 	si := 0
-
-	if hasAVX512 && n >= 64 {
-		si = decode512(a, dst, src)
-	} else if n >= 64 {
-		si = decodeAVX2(a, dst, src)
+	if hasAVX512 && len(src) >= 64 {
+		si += decode512(a, dst, src)
 	}
-	di := si * 3 / 4
-	if si+16 <= n {
-		si += decodeSSE(a, dst[di:], src[si:])
+	if len(src)-si >= 32 {
+		si += decodeAVX2(a, dst[si/4*3:], src[si:])
 	}
-
-	return si * 3 / 4, si
+	if len(src)-si >= 16 {
+		si += decodeSSE(a, dst[si/4*3:], src[si:])
+	}
+	return si
 }

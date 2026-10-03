@@ -1,8 +1,3 @@
-// Package simdenc implements base64 encoding as specified by RFC 4648,
-// with optional SIMD acceleration on amd64.
-//
-// The API mirrors encoding/base64. On platforms without SIMD support,
-// all operations delegate to encoding/base64.
 package simdenc
 
 import "encoding/base64"
@@ -13,12 +8,7 @@ const (
 
 	alphabetStd uint8 = 0
 	alphabetURL uint8 = 1
-
-	encodeStdAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	encodeURLAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
-
-var encAlphabets = [2]string{encodeStdAlpha, encodeURLAlpha}
 
 // Encoding defines a base64 encoding/decoding scheme.
 type Encoding struct {
@@ -33,16 +23,6 @@ var (
 	URLEncoding    = &Encoding{base: base64.URLEncoding, padChar: StdPadding, alphabet: alphabetURL}
 	RawStdEncoding = &Encoding{base: base64.RawStdEncoding, padChar: NoPadding, alphabet: alphabetStd}
 	RawURLEncoding = &Encoding{base: base64.RawURLEncoding, padChar: NoPadding, alphabet: alphabetURL}
-)
-
-// rawStdlib provides no-padding stdlib encodings for decoding error paths.
-var rawStdlib = [2]*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding}
-
-// SIMD dispatch: set by platform-specific init when SIMD is available.
-// When nil, Encode/Decode delegate entirely to encoding/base64.
-var (
-	simdEncode func(alphabet uint8, dst, src []byte) int
-	simdDecode func(alphabet uint8, dst, src []byte) (int, int)
 )
 
 // WithPadding returns a new Encoding identical to enc but with the given
@@ -67,23 +47,11 @@ func (enc *Encoding) DecodedLen(n int) int {
 	return n / 4 * 3
 }
 
+// Encode encodes src into dst like base64.Encoding.Encode. SIMD handles whole
+// 3-byte groups; the standard library finishes the rest, including padding.
 func (enc *Encoding) Encode(dst, src []byte) {
-	if simdEncode == nil || len(src) < 16 {
-		enc.base.Encode(dst, src)
-		return
-	}
-	si := simdEncode(enc.alphabet, dst, src)
-	if si < len(src) {
-		di := si * 4 / 3
-		rawStdlib[enc.alphabet].Encode(dst[di:], src[si:])
-	}
-	if enc.padChar != NoPadding {
-		n := enc.EncodedLen(len(src))
-		raw := (len(src)*4 + 2) / 3
-		for i := raw; i < n; i++ {
-			dst[i] = byte(enc.padChar)
-		}
-	}
+	si := encodeBlocks(enc.alphabet, dst, src)
+	enc.base.Encode(dst[si/3*4:], src[si:])
 }
 
 func (enc *Encoding) EncodeToString(src []byte) string {
@@ -99,24 +67,16 @@ func (enc *Encoding) AppendEncode(dst, src []byte) []byte {
 	return dst
 }
 
+// Decode decodes src into dst like base64.Encoding.Decode. SIMD handles whole
+// 4-character groups up to the first invalid character; the standard library
+// decodes the rest, so padding rules and error offsets are its own.
 func (enc *Encoding) Decode(dst, src []byte) (int, error) {
-	if simdDecode == nil {
-		return enc.base.Decode(dst, src)
+	si := decodeBlocks(enc.alphabet, dst, src)
+	n, err := enc.base.Decode(dst[si/4*3:], src[si:])
+	if corrupt, ok := err.(base64.CorruptInputError); ok {
+		err = corrupt + base64.CorruptInputError(si)
 	}
-	if enc.padChar != NoPadding {
-		for len(src) > 0 && src[len(src)-1] == byte(enc.padChar) {
-			src = src[:len(src)-1]
-		}
-	}
-	if len(src) < 16 {
-		return rawStdlib[enc.alphabet].Decode(dst, src)
-	}
-	di, si := simdDecode(enc.alphabet, dst, src)
-	if si == len(src) {
-		return di, nil
-	}
-	n, err := rawStdlib[enc.alphabet].Decode(dst[di:], src[si:])
-	return di + n, err
+	return si/4*3 + n, err
 }
 
 func (enc *Encoding) DecodeString(s string) ([]byte, error) {
